@@ -11,15 +11,24 @@ ordinary BibTeX. Provenance, integrity, and edit history live in a JSON sidecar
 that agents and `jq` can inspect directly.
 
 ```sh
-# Find likely duplicates without merging anything.
-biblock dedupe references.bib
+# Check verification state and get the next commands.
+biblock diagnosis references.bib
 
-# See what can be verified exactly and what still needs judgment.
-biblock source verify references.bib --all
+# If no lockfile exists, create one. This does not verify entries.
+biblock lock references.bib --sync
 
-# Apply exact provider records and write an auditable lockfile.
-biblock source verify references.bib --all --in-place
+# Compare title/author matches, then freeze a chosen provider record.
+biblock source match references.bib --key paper1
+biblock source propose references.bib --key paper1 --id PROVIDER_ID --agent codex
+
+# Read the saved diff and evidence. Adopt only if agentAdoptable is true
+# and the agent confirms it is the same work; use the returned proposal ID.
+biblock proposal list references.bib
+biblock proposal adopt references.bib --id PROPOSAL_ID --agent codex --reviewed
 ```
+
+Low-confidence matches and changes without provider support go to human review:
+`biblock review references.bib`.
 
 ## Why biblock?
 
