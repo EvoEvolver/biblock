@@ -279,26 +279,49 @@ pub fn title_search_query(record: &Record) -> BibliographicQuery {
 pub struct FieldChange {
     pub field: String,
     pub current: Option<String>,
-    pub proposed: String,
+    pub proposed: Option<String>,
 }
 
 pub fn changes(current: &Record, proposed: &LiteratureRecord) -> Vec<FieldChange> {
+    record_changes(current, &proposed_record(current, proposed))
+}
+
+pub fn proposed_record(current: &Record, proposed: &LiteratureRecord) -> Record {
+    let mut after = current.clone();
+    after.entry_type = proposed.bibtex_type().to_owned();
+    for field in crate::provenance::CONTROLLED_FIELDS {
+        after.fields.remove(*field);
+    }
+    after.fields.extend(proposed.bibtex_fields());
+    after
+}
+
+pub fn record_changes(current: &Record, proposed: &Record) -> Vec<FieldChange> {
     let mut output = Vec::new();
     if !current
         .entry_type
-        .eq_ignore_ascii_case(proposed.bibtex_type())
+        .eq_ignore_ascii_case(&proposed.entry_type)
     {
         output.push(FieldChange {
             field: "ENTRYTYPE".into(),
             current: Some(current.entry_type.clone()),
-            proposed: proposed.bibtex_type().into(),
+            proposed: Some(proposed.entry_type.clone()),
         });
     }
-    for (field, value) in proposed.bibtex_fields() {
-        if current.fields.get(&field) != Some(&value) {
+    for field in current
+        .fields
+        .keys()
+        .chain(proposed.fields.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+    {
+        if crate::history::is_workflow_field(field) {
+            continue;
+        }
+        let value = proposed.fields.get(field).cloned();
+        if current.fields.get(field) != value.as_ref() {
             output.push(FieldChange {
                 field: field.clone(),
-                current: current.fields.get(&field).cloned(),
+                current: current.fields.get(field).cloned(),
                 proposed: value,
             });
         }

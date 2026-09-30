@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,6 +31,7 @@ struct ReviewState {
     verified: usize,
     threshold: f64,
     entries: Vec<ReviewEntry>,
+    proposals: Vec<crate::proposal::ProposalView>,
 }
 
 #[derive(Serialize)]
@@ -46,12 +47,15 @@ struct ReviewEntry {
     url: Option<String>,
     fields: std::collections::BTreeMap<String, String>,
     source: serde_json::Value,
+    content_hash: String,
+    approval: Option<history::ApprovalLock>,
 }
 
 #[derive(Deserialize)]
 struct ApproveRequest {
     keys: Vec<String>,
     reviewer: Option<String>,
+    hashes: BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -66,6 +70,7 @@ struct AdoptRequest {
     id: String,
     provider: String,
     reviewer: Option<String>,
+    preview_hash: String,
 }
 
 #[derive(Deserialize)]
@@ -79,6 +84,8 @@ struct ApplyBibtexRequest {
     key: String,
     bibtex: String,
     reviewer: Option<String>,
+    baseline_hash: String,
+    proposal_hash: String,
 }
 
 #[derive(Serialize)]
@@ -87,6 +94,8 @@ struct BibtexPreview {
     pasted_key: String,
     entry_type: String,
     comparison: Vec<FieldComparison>,
+    baseline_hash: String,
+    proposal_hash: String,
 }
 
 #[derive(Serialize)]
@@ -107,6 +116,22 @@ struct CandidateView {
     record: crate::catalog::LiteratureRecord,
     entry_type: String,
     comparison: Vec<FieldComparison>,
+    preview_hash: String,
+}
+
+struct ReviewDraft {
+    expected: String,
+    proposed: String,
+    key: String,
+    provider: String,
+    id: String,
+}
+
+#[derive(Deserialize)]
+struct ProposalDecisionRequest {
+    id: String,
+    adopt: bool,
+    reviewer: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -130,6 +155,7 @@ pub fn run(file: &Path, port: u16, open: bool, threshold: f64) -> Result<u8> {
     }
 
     let mut finished = false;
+    let mut drafts = BTreeMap::new();
     while !finished {
         let request = server
             .recv()
@@ -145,6 +171,7 @@ pub fn run(file: &Path, port: u16, open: bool, threshold: f64) -> Result<u8> {
         let bibtex_preview_path = format!("/{token}/api/bibtex/preview");
         let bibtex_apply_path = format!("/{token}/api/bibtex/apply");
         let finish_path = format!("/{token}/api/finish");
+        let proposal_path = format!("/{token}/api/proposal");
         match (request.method(), path) {
             (&Method::Get, value) if value == root => respond_html(request, PAGE)?,
             (&Method::Get, value) if value == style_path => {
@@ -160,10 +187,10 @@ pub fn run(file: &Path, port: u16, open: bool, threshold: f64) -> Result<u8> {
                 handle_approve(request, file, threshold)?
             }
             (&Method::Post, value) if value == candidates_path => {
-                handle_candidates(request, file, threshold)?
+                handle_candidates(request, file, threshold, &mut drafts)?
             }
             (&Method::Post, value) if value == adopt_path => {
-                handle_adopt(request, file, threshold)?
+                handle_adopt(request, file, threshold, &drafts)?
             }
             (&Method::Post, value) if value == bibtex_preview_path => {
                 handle_bibtex_preview(request, file)?
@@ -175,15 +202,25 @@ pub fn run(file: &Path, port: u16, open: bool, threshold: f64) -> Result<u8> {
                 respond_json(request, StatusCode(200), &state(file, threshold)?)?;
                 finished = true;
             }
+            (&Method::Post, value) if value == proposal_path => {
+                handle_proposal(request, file, threshold)?
+            }
             _ => respond_text(request, StatusCode(404), "Not found")?,
         }
     }
     let final_state = state(file, threshold)?;
-    Ok(if final_state.verified == final_state.total {
-        0
-    } else {
-        3
-    })
+    Ok(
+        if final_state.verified == final_state.total
+            && !final_state
+                .proposals
+                .iter()
+                .any(|proposal| proposal.proposal.decision.is_none())
+        {
+            0
+        } else {
+            3
+        },
+    )
 }
 
 fn handle_approve(mut request: Request, file: &Path, threshold: f64) -> Result<()> {
@@ -219,29 +256,61 @@ fn handle_approve(mut request: Request, file: &Path, threshold: f64) -> Result<(
         );
     }
     let reviewer = input.reviewer.as_deref().map(str::trim);
-    history::approve(file, &keys, reviewer)?;
+    if current.proposals.iter().any(|proposal| {
+        proposal.proposal.decision.is_none() && keys.contains(&proposal.proposal.target)
+    }) {
+        return respond_text(
+            request,
+            StatusCode(409),
+            "Review the pending proposal instead of approving the old entry",
+        );
+    }
+    if let Err(error) = history::approve_bound(file, &keys, reviewer, Some(&input.hashes)) {
+        return respond_text(request, StatusCode(409), &format!("{error:#}"));
+    }
     respond_json(request, StatusCode(200), &state(file, threshold)?)
 }
 
-fn handle_candidates(mut request: Request, file: &Path, threshold: f64) -> Result<()> {
+fn handle_candidates(
+    mut request: Request,
+    file: &Path,
+    threshold: f64,
+    drafts: &mut BTreeMap<String, ReviewDraft>,
+) -> Result<()> {
     let input: CandidateRequest = match read_json(&mut request) {
         Ok(input) => input,
         Err(error) => return respond_text(request, StatusCode(400), &format!("{error:#}")),
     };
-    match search_candidates(file, &input.key, &input.provider, threshold) {
+    match search_candidates(file, &input.key, &input.provider, threshold, drafts) {
         Ok(result) => respond_json(request, StatusCode(200), &result),
         Err(error) => respond_text(request, StatusCode(502), &format!("{error:#}")),
     }
 }
 
-fn handle_adopt(mut request: Request, file: &Path, threshold: f64) -> Result<()> {
+fn handle_adopt(
+    mut request: Request,
+    file: &Path,
+    threshold: f64,
+    drafts: &BTreeMap<String, ReviewDraft>,
+) -> Result<()> {
     let input: AdoptRequest = match read_json(&mut request) {
         Ok(input) => input,
         Err(error) => return respond_text(request, StatusCode(400), &format!("{error:#}")),
     };
-    match adopt_candidate(file, &input, threshold) {
+    match adopt_candidate(file, &input, drafts) {
         Ok(()) => respond_json(request, StatusCode(200), &state(file, threshold)?),
-        Err(error) => respond_text(request, StatusCode(400), &format!("{error:#}")),
+        Err(error) => respond_text(request, StatusCode(409), &format!("{error:#}")),
+    }
+}
+
+fn handle_proposal(mut request: Request, file: &Path, threshold: f64) -> Result<()> {
+    let input: ProposalDecisionRequest = match read_json(&mut request) {
+        Ok(input) => input,
+        Err(error) => return respond_text(request, StatusCode(400), &format!("{error:#}")),
+    };
+    match crate::proposal::decide(file, &input.id, input.adopt, input.reviewer.as_deref()) {
+        Ok(()) => respond_json(request, StatusCode(200), &state(file, threshold)?),
+        Err(error) => respond_text(request, StatusCode(409), &format!("{error:#}")),
     }
 }
 
@@ -305,8 +374,10 @@ fn preview_bibtex(file: &Path, input: &BibtexRequest) -> Result<BibtexPreview> {
     let (pasted_key, pasted) = pasted_record(&input.bibtex, &input.key)?;
     Ok(BibtexPreview {
         pasted_key,
-        entry_type: pasted.entry_type,
+        entry_type: pasted.entry_type.clone(),
         comparison: compare_fields(&bibliographic_fields(&current.fields), &pasted.fields),
+        baseline_hash: crate::integrity::hash(current)?,
+        proposal_hash: crate::integrity::hash(&pasted)?,
     })
 }
 
@@ -320,6 +391,15 @@ fn apply_bibtex(file: &Path, input: &ApplyBibtexRequest) -> Result<()> {
         bail!("citation key not found: {}", input.key);
     }
     let (_, replacement) = pasted_record(&input.bibtex, &input.key)?;
+    let current = records
+        .iter()
+        .find(|record| record.entry_key == input.key)
+        .context("entry not found")?;
+    if crate::integrity::hash(current)? != input.baseline_hash
+        || crate::integrity::hash(&replacement)? != input.proposal_hash
+    {
+        bail!("BibTeX changed since preview; preview again before approving");
+    }
     let proposed = replace_entry(&expected, &replacement)?;
     history::commit_human_edit(
         file,
@@ -337,6 +417,7 @@ fn search_candidates(
     key: &str,
     provider: &str,
     threshold: f64,
+    drafts: &mut BTreeMap<String, ReviewDraft>,
 ) -> Result<CandidateResponse> {
     let source = history::hydrate_file(file)?;
     let records = parse(&source)?;
@@ -345,27 +426,55 @@ fn search_candidates(
         .find(|record| !record.is_system() && record.entry_key == key)
         .with_context(|| format!("citation key not found: {key}"))?;
     let query = title_query(record)?;
-    let search = providers::open(provider, None)?.search(&query, 5)?;
+    let backend = providers::open(provider, None)?;
+    let search = backend.search(&query, 5)?;
+    drafts.retain(|_, draft| draft.key != key || draft.provider != provider);
     let candidates = search
         .candidates
-        .into_iter()
+        .iter()
         .map(|candidate| {
-            let similarity = dedupe::literature_similarity(record, &candidate.record);
+            let fetched = backend.lookup(&LiteratureIdentifier::ProviderId(
+                candidate.record.id.clone(),
+            ))?;
+            if !fetched.record.id.eq_ignore_ascii_case(&candidate.record.id) {
+                bail!("provider lookup returned a different record id");
+            }
+            let similarity = dedupe::literature_similarity(record, &fetched.record);
             let current = bibliographic_fields(&record.fields);
             let proposed = adopted_bibliographic_fields(
                 &current,
-                &bibliographic_fields(&candidate.record.bibtex_fields()),
+                &bibliographic_fields(&fetched.record.bibtex_fields()),
             );
-            CandidateView {
+            let input = AdoptRequest {
+                key: key.to_owned(),
+                id: candidate.record.id.clone(),
+                provider: provider.to_owned(),
+                reviewer: None,
+                preview_hash: String::new(),
+            };
+            let draft = prepare_candidate(&source, record, &input, threshold, &search, &fetched)?;
+            let preview_hash = format!(
+                "{:x}",
+                Sha256::digest(serde_json::to_vec(&(
+                    &draft.expected,
+                    &draft.proposed,
+                    &draft.key,
+                    &draft.provider,
+                    &draft.id
+                ))?)
+            );
+            drafts.insert(preview_hash.clone(), draft);
+            Ok(CandidateView {
                 provider_score: candidate.score,
                 adoptable: similarity.is_some_and(|value| value.score >= threshold),
-                entry_type: candidate.record.bibtex_type().to_owned(),
+                entry_type: fetched.record.bibtex_type().to_owned(),
                 comparison: compare_fields(&current, &proposed),
                 similarity,
-                record: candidate.record,
-            }
+                record: fetched.record,
+                preview_hash,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(CandidateResponse {
         provider: provider.to_owned(),
         query: query.citation,
@@ -374,17 +483,37 @@ fn search_candidates(
     })
 }
 
-fn adopt_candidate(file: &Path, input: &AdoptRequest, threshold: f64) -> Result<()> {
-    let expected = history::hydrate_file(file)?;
-    let records = parse(&expected)?;
-    let record = records
-        .iter()
-        .find(|record| !record.is_system() && record.entry_key == input.key)
-        .cloned()
-        .with_context(|| format!("citation key not found: {}", input.key))?;
-    let query = title_query(&record)?;
-    let backend = providers::open(&input.provider, None)?;
-    let search = backend.search(&query, 5)?;
+fn adopt_candidate(
+    file: &Path,
+    input: &AdoptRequest,
+    drafts: &BTreeMap<String, ReviewDraft>,
+) -> Result<()> {
+    let draft = drafts
+        .get(&input.preview_hash)
+        .context("preview expired; search and review again")?;
+    if draft.key != input.key || draft.id != input.id || draft.provider != input.provider {
+        bail!("adoption does not match the reviewed preview");
+    }
+    history::commit_human_edit(
+        file,
+        &draft.expected,
+        &draft.proposed,
+        &draft.key,
+        input.reviewer.as_deref(),
+        "provider-adopt",
+    )?;
+    Ok(())
+}
+
+fn prepare_candidate(
+    expected: &str,
+    record: &Record,
+    input: &AdoptRequest,
+    threshold: f64,
+    search: &providers::FetchedSearch,
+    fetched: &providers::FetchedRecord,
+) -> Result<ReviewDraft> {
+    let query = title_query(record)?;
     let candidate = search
         .candidates
         .iter()
@@ -395,35 +524,30 @@ fn adopt_candidate(file: &Path, input: &AdoptRequest, threshold: f64) -> Result<
                 input.id
             )
         })?;
-    let similarity = dedupe::literature_similarity(&record, &candidate.record)
-        .context("title/author scoring requires both fields on both records")?;
+    let similarity = dedupe::literature_similarity(record, &fetched.record);
     let actor = input
         .reviewer
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("anonymous-browser-review");
-    let search_source = provenance::search_source(&record, &query, &search, &input.provider)?;
+    let search_source = provenance::search_source(record, &query, search, &input.provider)?;
     let selection_source = provenance::selection_source_with_match(
         &search_source,
         &input.id,
         actor,
         "browser-review",
-        Some(provenance::MatchEvidence {
+        similarity.map(|similarity| provenance::MatchEvidence {
             score: similarity.score,
             title_score: similarity.title_score,
             author_score: similarity.author_score,
             threshold,
         }),
     )?;
-    let fetched = backend.lookup(&LiteratureIdentifier::ProviderId(input.id.clone()))?;
-    let provider_source = provenance::provider_source_with_evidence(
-        &fetched,
-        None,
-        Some(&selection_source.entry_key),
-    );
+    let provider_source =
+        provenance::provider_source_with_evidence(fetched, None, Some(&selection_source.entry_key));
     let mut proposed = update_entry_fields_exact(
-        &expected,
+        expected,
         &input.key,
         &record.entry_type,
         &std::collections::BTreeMap::new(),
@@ -451,15 +575,14 @@ fn adopt_candidate(file: &Path, input: &AdoptRequest, threshold: f64) -> Result<
         &BTreeSet::from([input.key.clone()]),
         false,
     )?;
-    history::commit_edit(
-        file,
-        None,
-        &expected,
-        &proposed,
-        "provider-adopt",
-        Some(actor),
-    )?;
-    Ok(())
+    let _ = candidate;
+    Ok(ReviewDraft {
+        expected: expected.to_owned(),
+        proposed,
+        key: input.key.clone(),
+        provider: input.provider.clone(),
+        id: input.id.clone(),
+    })
 }
 
 fn title_query(record: &Record) -> Result<BibliographicQuery> {
@@ -480,6 +603,7 @@ fn state(file: &Path, threshold: f64) -> Result<ReviewState> {
         );
     }
     let source = history::hydrate_file(file)?;
+    let lock = history::read_required_lock(file, None)?;
     let records = parse(&source)?;
     let mut entries = Vec::new();
     for record in records.iter().filter(|record| !record.is_system()) {
@@ -495,6 +619,11 @@ fn state(file: &Path, threshold: f64) -> Result<ReviewState> {
             url: safe_url(record),
             fields: bibliographic_fields(&record.fields),
             source: serde_json::to_value(provenance::summary(record, &records))?,
+            content_hash: crate::integrity::hash(record)?,
+            approval: lock
+                .entries
+                .get(&record.entry_key)
+                .and_then(|entry| entry.approval.clone()),
         });
     }
     let verified = entries
@@ -512,6 +641,7 @@ fn state(file: &Path, threshold: f64) -> Result<ReviewState> {
         verified,
         threshold,
         entries,
+        proposals: crate::proposal::list(file)?,
     })
 }
 
@@ -654,6 +784,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pasted_apply_rejects_content_that_was_not_previewed() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("refs.bib");
+        fs::write(&file, "@article{one, title={Old}}\n").unwrap();
+        history::sync(&file, None, false, false, None).unwrap();
+        let preview = preview_bibtex(
+            &file,
+            &BibtexRequest {
+                key: "one".to_owned(),
+                bibtex: "@book{x, title={Reviewed}}".to_owned(),
+            },
+        )
+        .unwrap();
+        let input = ApplyBibtexRequest {
+            key: "one".to_owned(),
+            bibtex: "@book{x, title={Not reviewed}}".to_owned(),
+            reviewer: None,
+            baseline_hash: preview.baseline_hash,
+            proposal_hash: preview.proposal_hash,
+        };
+        assert!(apply_bibtex(&file, &input).is_err());
+        assert!(fs::read_to_string(&file).unwrap().contains("Old"));
+    }
+
+    #[test]
+    fn cached_browser_adoption_requires_the_exact_preview_and_baseline() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("refs.bib");
+        fs::write(&file, "@article{one, title={Old}}\n").unwrap();
+        history::sync(&file, None, false, false, None).unwrap();
+        let expected = history::hydrate_file(&file).unwrap();
+        let proposed = replace_entry(
+            &expected,
+            &parse("@article{one, title={Reviewed}}").unwrap()[0],
+        )
+        .unwrap();
+        let drafts = BTreeMap::from([(
+            "preview1".to_owned(),
+            ReviewDraft {
+                expected,
+                proposed,
+                key: "one".to_owned(),
+                provider: "crossref".to_owned(),
+                id: "record1".to_owned(),
+            },
+        )]);
+        let input = AdoptRequest {
+            key: "one".to_owned(),
+            provider: "crossref".to_owned(),
+            id: "record1".to_owned(),
+            reviewer: None,
+            preview_hash: "wrong-preview".to_owned(),
+        };
+        assert!(adopt_candidate(&file, &input, &drafts).is_err());
+        let input = AdoptRequest {
+            preview_hash: "preview1".to_owned(),
+            ..input
+        };
+        fs::write(&file, "@article{one, title={External change}}\n").unwrap();
+        history::sync(&file, None, false, false, None).unwrap();
+        assert!(adopt_candidate(&file, &input, &drafts).is_err());
+        assert!(
+            fs::read_to_string(&file)
+                .unwrap()
+                .contains("External change")
+        );
+    }
+
+    #[test]
     fn candidate_comparison_preserves_uncontrolled_bibtex_fields() {
         let current = BTreeMap::from([
             ("title".to_owned(), "Old".to_owned()),
@@ -692,6 +891,19 @@ mod tests {
                 bibtex: "@book{different, title={New title}, author={New Author}, year={2024}}"
                     .to_owned(),
                 reviewer: Some("Researcher".to_owned()),
+                baseline_hash: crate::integrity::hash(
+                    &parse(&fs::read_to_string(&file).unwrap()).unwrap()[0],
+                )
+                .unwrap(),
+                proposal_hash: crate::integrity::hash(
+                    &pasted_record(
+                        "@book{different, title={New title}, author={New Author}, year={2024}}",
+                        "one",
+                    )
+                    .unwrap()
+                    .1,
+                )
+                .unwrap(),
             },
         )
         .unwrap();

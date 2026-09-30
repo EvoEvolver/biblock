@@ -142,8 +142,7 @@ pub(crate) fn record_from_response(id: &str, response: &[u8]) -> Result<Literatu
         .notes
         .iter()
         .find(|note| note.get("id").and_then(Value::as_str) == Some(id))
-        .or_else(|| parsed.notes.first())
-        .context("OpenReview response contains no note")?;
+        .with_context(|| format!("OpenReview response contains no matching note {id}"))?;
     note_to_record(note)
 }
 

@@ -11,12 +11,14 @@ use biblock_cli::catalog::{
     PROVIDER_FIELD, PROVIDER_ID_FIELD, changes, title_search_query,
 };
 use biblock_cli::dedupe::{self, LocatedRecord};
+use biblock_cli::diagnosis;
 use biblock_cli::history;
 use biblock_cli::inspect;
 use biblock_cli::integrity::{
     APPROVAL_FIELDS, Status, hash, remove_entry_type_fields, status, update_entry_fields,
     update_entry_fields_exact, update_source,
 };
+use biblock_cli::proposal;
 use biblock_cli::provenance::{self, CONTROLLED_FIELDS, SOURCE_FIELD, SOURCE_TYPE, SourceKind};
 use biblock_cli::providers::{self, DEFAULT_PROVIDER};
 use biblock_cli::resolver::{self, ResolutionReport};
@@ -26,7 +28,15 @@ use serde::Serialize;
 
 const LONG_ABOUT: &str = "Resolve literature URLs, reconcile BibTeX with pluggable metadata providers, inspect entries as JSON, find likely duplicates, and maintain source-bound verification in a JSON .bib.lock sidecar. The bibliography remains standard BibTeX. Crossref is the default provider; DOI content negotiation is also built in.";
 
-const AFTER_HELP: &str = r#"INSPECT AND PIPE
+const AFTER_HELP: &str = r#"DIAGNOSIS
+  Summarize local lockfile and verification state, pending keys, and next commands:
+    biblock diagnosis refs.bib
+
+  This read-only JSON report makes no API requests. Exit 0 means the lockfile is
+  consistent, every entry is verified, and no proposals are pending;
+  exit 3 means work remains.
+
+INSPECT AND PIPE
   Emit bibliography entries and integrity state as one JSON array:
     biblock inspect refs.bib
 
@@ -44,6 +54,28 @@ DEDUPLICATION
   Results include component scores and complete entry fields for agent review.
   biblock never merges or removes entries automatically.
 
+AGENT PROPOSALS
+  Start with diagnosis, then search and freeze an explicitly chosen API candidate:
+    biblock source match refs.bib --key paper1 --min-score 0.9
+    biblock source propose refs.bib --key paper1 --id DOI --agent codex
+    biblock proposal list refs.bib
+
+  Read the saved replacement, full diff, scores and receipts. Confirm the same
+  work (including publication version), then adopt only if agentAdoptable is true:
+    biblock proposal adopt refs.bib --id proposal:... --agent codex --reviewed
+
+  Adoption uses frozen evidence without another API request and records API-backed
+  verified status, not human approval. Missing provider support, low scores or
+  multiple qualifying candidates require human review. Stale proposals must be
+  recreated. Do not edit .bib directly: external edits fail the lockfile check;
+  lock --sync records edits in history but does not verify them.
+
+  Save a replacement only in FILE.lock, then let a human compare and decide:
+    biblock proposal create refs.bib --key paper1 --bibtex replacement.bib \
+      --agent codex --reason 'Corrected metadata'
+    biblock proposal list refs.bib
+    biblock review refs.bib
+
 LITERATURE SOURCES
   Providers map their native metadata into one common literature record. Crossref is
   the default backend. Verify exact identifiers across a complete file, then inspect
@@ -58,8 +90,9 @@ LITERATURE SOURCES
   Compare provider title-search results with a fixed title/author score before an
   agent explicitly adopts one candidate (use --provider openreview when needed):
     biblock source match refs.bib --key paper1 --min-score 0.9
-    biblock source apply refs.bib --key paper1 --id DOI --selected-by AGENT \
-      --min-score 0.9 --add-integrity --in-place
+    biblock source propose refs.bib --key paper1 --id DOI --agent AGENT
+    biblock proposal list refs.bib
+    biblock proposal adopt refs.bib --id proposal:... --agent AGENT --reviewed
 
   A URL is resolved to a stable DOI from the URL itself, redirects, publisher
   metadata, JSON-LD, or an official identifier API:
@@ -148,6 +181,17 @@ EXIT STATUS
   3  Candidate pairs were found and need review"#;
 
 const SOURCE_AFTER_HELP: &str = r#"WORKFLOW
+  Start with biblock diagnosis refs.bib. For search-based replacements, use the
+  frozen proposal workflow instead of re-fetching a candidate when applying it:
+    biblock source match refs.bib --key paper1 --min-score 0.9
+    biblock source propose refs.bib --key paper1 --id DOI --agent codex
+    biblock proposal list refs.bib
+    biblock proposal adopt refs.bib --id proposal:... --agent codex --reviewed
+
+  Read the fixed diff and receipts before adopting; require agentAdoptable=true
+  and confirm semantic identity. Low scores, ambiguity or missing provider support
+  require biblock review refs.bib. A matching score is not automatic approval.
+
   1. Batch exact DOI and URL verification with Crossref-to-DOI fallback. This
      writes nothing without --in-place and never selects search candidates:
        biblock source verify refs.bib --all
@@ -161,7 +205,8 @@ const SOURCE_AFTER_HELP: &str = r#"WORKFLOW
      chosen candidate id and selector identity. This records the search response,
      candidate set, selection, and exact provider lookup as one evidence chain:
        biblock source apply refs.bib --key paper1 --id 10.1234/example \
-         --selected-by codex --add-integrity --in-place
+         --selected-by codex --baseline-hash BASELINE_HASH \
+         --proposal-hash PROPOSAL_HASH --add-integrity --in-place
   4. Either add provider-backed integrity atomically with apply:
        biblock source apply refs.bib --key paper1 --add-integrity --in-place
      or record an attributed review separately:
@@ -228,6 +273,10 @@ const VERIFY_AFTER_HELP: &str = r#"WORKFLOW
   Dry-run and inspect the JSON report:
     biblock source verify refs.bib --all
 
+  Bind a write to the exact entries and replacements you reviewed:
+    biblock source verify refs.bib --all > preview.json
+    biblock source verify refs.bib --all --in-place --reviewed preview.json
+
   Reconcile exact records, add provider integrity, and write once:
     biblock source verify refs.bib --all --in-place
 
@@ -254,6 +303,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Save agent-proposed replacements in the lockfile for human review.
+    Proposal(ProposalArgs),
+    /// Diagnose local verification state and emit actionable commands as JSON.
+    Diagnosis(DiagnosisArgs),
     /// Review and approve entries in a local browser.
     Review(ReviewArgs),
     /// Emit bibliography entries and their trust state as JSON.
@@ -268,6 +321,79 @@ enum Command {
     History(HistoryArgs),
     /// Check or synchronize the JSON sidecar lockfile.
     Lock(LockArgs),
+}
+
+const PROPOSAL_AFTER_HELP: &str = r#"AGENT WORKFLOW
+  biblock diagnosis refs.bib
+  biblock source match refs.bib --key paper1 --min-score 0.9
+  biblock source propose refs.bib --key paper1 --id DOI --agent codex
+  biblock proposal list refs.bib
+  biblock proposal adopt refs.bib --id proposal:... --agent codex --reviewed
+
+Read the saved before/after records, comparison, matchScore, provider receipts and
+agentAdoptionBlocker. Confirm the same work and publication version. Adopt only
+when agentAdoptable is true; --reviewed records your explicit confirmation.
+Adoption never re-fetches metadata and writes provider-backed verified status,
+the adopting agent and reversible history, without adding human approval.
+
+Missing provider support, low scores or multiple qualifying candidates require
+human review: biblock review refs.bib. Freeform proposal create --evidence JSON
+does not grant API authority. Stale baselines require a new proposal; decided
+proposals cannot be adopted again. Check biblock diagnosis refs.bib afterward.
+Do not hard-edit .bib or .lock: external changes fail the lockfile consistency
+check. lock --sync records external edits but does not make them verified."#;
+
+#[derive(Args)]
+#[command(after_help = PROPOSAL_AFTER_HELP)]
+struct ProposalArgs {
+    #[command(subcommand)]
+    command: ProposalCommand,
+}
+
+#[derive(Subcommand)]
+enum ProposalCommand {
+    /// Save one complete replacement without changing or approving the bibliography.
+    Create {
+        file: PathBuf,
+        #[arg(long)]
+        key: String,
+        /// File containing exactly one replacement entry. Use - for stdin.
+        #[arg(long)]
+        bibtex: PathBuf,
+        #[arg(long)]
+        agent: String,
+        #[arg(long)]
+        reason: String,
+        /// Optional JSON evidence; retained as supporting information, not API authority.
+        #[arg(long)]
+        evidence: Option<PathBuf>,
+    },
+    /// Show immutable proposals, complete differences, decisions and stale baselines.
+    List { file: PathBuf },
+    /// Adopt a frozen, unambiguous provider-backed proposal after reading its diff.
+    #[command(after_help = PROPOSAL_AFTER_HELP)]
+    Adopt {
+        file: PathBuf,
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        agent: String,
+        /// Confirm that you have read the saved replacement and comparison.
+        #[arg(long)]
+        reviewed: bool,
+    },
+}
+
+#[derive(Args)]
+#[command(
+    after_help = "Read-only local check: no API requests or file changes. JSON includes lock status, trust counts, pending entries, and commands with argv and writes flags. Exit 0 means the lockfile is valid and every entry is verified; exit 3 means work remains; exit 2 means invalid BibTeX or an operational error. Synchronizing a lockfile does not verify entries."
+)]
+struct DiagnosisArgs {
+    /// BibTeX file to diagnose. Omit to check all .bib files in the current directory.
+    file: Option<PathBuf>,
+    /// Emit JSON without indentation.
+    #[arg(long)]
+    compact: bool,
 }
 
 #[derive(Args)]
@@ -349,6 +475,30 @@ struct SourceArgs {
 
 #[derive(Subcommand)]
 enum SourceCommand {
+    /// Freeze one provider replacement and its search receipts in the lockfile, without editing BibTeX.
+    #[command(after_help = PROPOSAL_AFTER_HELP)]
+    Propose {
+        file: PathBuf,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "crossref")]
+        provider: String,
+        #[arg(long)]
+        agent: String,
+        #[arg(
+            long,
+            default_value = "Selected provider record for metadata reconciliation"
+        )]
+        reason: String,
+        #[arg(long, default_value_t = 0.9, value_parser = parse_score)]
+        min_score: f64,
+        #[arg(long, default_value_t = 5, value_parser = parse_limit)]
+        search_limit: usize,
+        #[arg(long, env = "BIBLOCK_MAILTO")]
+        mailto: Option<String>,
+    },
     /// List installed literature metadata providers.
     Providers,
     /// Batch provider verification with Crossref-to-DOI fallback.
@@ -373,6 +523,9 @@ enum SourceCommand {
         /// Atomically write all successful exact matches in one replacement.
         #[arg(short, long)]
         in_place: bool,
+        /// JSON report from a previous dry run. Reject changes to its reviewed entries or replacements.
+        #[arg(long, requires = "in_place")]
+        reviewed: Option<PathBuf>,
         /// Emit compact JSON.
         #[arg(short, long)]
         compact: bool,
@@ -483,8 +636,14 @@ enum SourceCommand {
         #[arg(long)]
         id: Option<String>,
         /// Record an auditable search-and-selection chain for an explicit id.
-        #[arg(long, requires = "id", value_name = "ACTOR")]
+        #[arg(long, requires_all = ["id", "baseline_hash", "proposal_hash"], value_name = "ACTOR")]
         selected_by: Option<String>,
+        /// Current entry hash from the candidate report you reviewed.
+        #[arg(long, requires = "proposal_hash")]
+        baseline_hash: Option<String>,
+        /// Replacement hash from the candidate report. Rejects changed API metadata.
+        #[arg(long, requires = "baseline_hash")]
+        proposal_hash: Option<String>,
         /// Require the selected result to meet the title/author similarity threshold.
         #[arg(long, requires = "selected_by", value_parser = parse_score)]
         min_score: Option<f64>,
@@ -682,6 +841,9 @@ struct PlannedCandidate {
     author_score: Option<f64>,
     record: LiteratureRecord,
     changes: Vec<FieldChange>,
+    baseline_hash: String,
+    proposal_hash: String,
+    proposed: Record,
 }
 
 #[derive(Serialize)]
@@ -754,6 +916,65 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<u8> {
     match cli.command {
+        Command::Proposal(args) => {
+            match args.command {
+                ProposalCommand::Create {
+                    file,
+                    key,
+                    bibtex,
+                    agent,
+                    reason,
+                    evidence,
+                } => {
+                    let mut input = String::new();
+                    if bibtex == Path::new("-") {
+                        io::stdin().read_to_string(&mut input)?;
+                    } else {
+                        input = fs::read_to_string(bibtex)?;
+                    }
+                    let evidence = evidence
+                        .map(|path| -> Result<serde_json::Value> {
+                            Ok(serde_json::from_str(&fs::read_to_string(path)?)?)
+                        })
+                        .transpose()?
+                        .unwrap_or(serde_json::Value::Null);
+                    print_serializable(
+                        &proposal::create(&file, &key, &input, &agent, &reason, evidence)?,
+                        false,
+                    )?;
+                }
+                ProposalCommand::List { file } => {
+                    print_serializable(&proposal::list(&file)?, false)?
+                }
+                ProposalCommand::Adopt {
+                    file,
+                    id,
+                    agent,
+                    reviewed,
+                } => {
+                    proposal::adopt(&file, &id, &agent, reviewed)?;
+                    print_serializable(&proposal::list(&file)?, false)?;
+                }
+            }
+            Ok(0)
+        }
+        Command::Diagnosis(args) => {
+            if let Some(file) = args.file {
+                let report = diagnosis::report(&file)?;
+                print_serializable(&report, args.compact)?;
+                Ok(if report.ready { 0 } else { 3 })
+            } else {
+                let report = diagnosis::directory_report(Path::new("."))?;
+                print_serializable(&report, args.compact)?;
+                Ok(if !report.errors.is_empty() {
+                    2
+                } else if report.ready {
+                    0
+                } else {
+                    3
+                })
+            }
+        }
         Command::Review(args) => review::run(&args.file, args.port, !args.no_open, args.threshold),
         Command::Inspect(args) => {
             let InspectArgs {
@@ -797,6 +1018,33 @@ fn run_lock(args: LockArgs) -> Result<u8> {
 
 fn run_source(command: SourceCommand) -> Result<u8> {
     match command {
+        SourceCommand::Propose {
+            file,
+            key,
+            id,
+            provider,
+            agent,
+            reason,
+            min_score,
+            search_limit,
+            mailto,
+        } => {
+            print_serializable(
+                &proposal::create_provider(
+                    &file,
+                    &key,
+                    &provider,
+                    &id,
+                    &agent,
+                    &reason,
+                    min_score,
+                    search_limit,
+                    mailto.as_deref(),
+                )?,
+                false,
+            )?;
+            Ok(0)
+        }
         SourceCommand::Providers => {
             for name in providers::names() {
                 println!(
@@ -818,6 +1066,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
             providers,
             limit,
             in_place,
+            reviewed,
             compact,
             mailto,
             history_write,
@@ -828,6 +1077,7 @@ fn run_source(command: SourceCommand) -> Result<u8> {
             &providers,
             limit,
             in_place,
+            reviewed.as_deref(),
             compact,
             mailto.as_deref(),
             &history_write,
@@ -906,16 +1156,28 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                         let candidates: Vec<_> = search
                             .candidates
                             .into_iter()
-                            .map(|candidate| {
-                                let candidate = planned_candidate(record, candidate);
-                                MatchCandidate {
+                            .map(|candidate| -> Result<_> {
+                                let fetched = backend.lookup(&LiteratureIdentifier::ProviderId(
+                                    candidate.record.id.clone(),
+                                ))?;
+                                if !fetched.record.id.eq_ignore_ascii_case(&candidate.record.id) {
+                                    bail!("provider returned a different record id");
+                                }
+                                let candidate = planned_candidate(
+                                    record,
+                                    Candidate {
+                                        score: candidate.score,
+                                        record: fetched.record,
+                                    },
+                                );
+                                Ok(MatchCandidate {
                                     adoptable: candidate
                                         .match_score
                                         .is_some_and(|score| score >= min_score),
                                     candidate,
-                                }
+                                })
                             })
-                            .collect();
+                            .collect::<Result<_>>()?;
                         let unique_adoptable =
                             candidates.iter().filter(|item| item.adoptable).count() == 1;
                         rows.push(MatchRow {
@@ -1116,6 +1378,8 @@ fn run_source(command: SourceCommand) -> Result<u8> {
             key,
             id,
             selected_by,
+            baseline_hash,
+            proposal_hash,
             min_score,
             search_limit,
             provider,
@@ -1130,6 +1394,12 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                 .iter()
                 .find(|record| record.entry_key == key)
                 .with_context(|| format!("citation key not found: {key}"))?;
+            if baseline_hash
+                .as_ref()
+                .is_some_and(|expected| hash(record).ok().as_ref() != Some(expected))
+            {
+                bail!("entry changed since candidate review; review it again");
+            }
             let (provider_name, stored_id) = source_identity(record, provider.as_deref());
             let mut resolution_candidate = None;
             let explicit_id = id.clone();
@@ -1226,7 +1496,23 @@ fn run_source(command: SourceCommand) -> Result<u8> {
                 None
             };
             let fetched = backend.lookup(&identifier)?;
+            if let Some(threshold) = min_score {
+                let similarity = dedupe::literature_similarity(record, &fetched.record)
+                    .context("exact provider record cannot be scored by title and author")?;
+                if similarity.score < threshold {
+                    bail!("exact provider record is below --min-score; review it again");
+                }
+            }
             let provider_id = fetched.record.id.clone();
+            let replacement = biblock_cli::catalog::proposed_record(record, &fetched.record);
+            if proposal_hash
+                .as_ref()
+                .is_some_and(|expected| hash(&replacement).ok().as_ref() != Some(expected))
+            {
+                bail!(
+                    "provider metadata changed since candidate review; review the new diff before applying"
+                );
+            }
             let (output, receipt_key) = reconcile_fetched(
                 &source,
                 &key,
@@ -1346,9 +1632,25 @@ fn run_web(
                 )?;
                 let records = parse(&output)?;
                 output = update_source(&output, &records, &BTreeSet::from([key.clone()]), false)?;
+                let records = parse(&output)?;
+                let target = records
+                    .iter()
+                    .find(|record| record.entry_key == key)
+                    .context("updated entry missing")?;
+                let trust = status(target, &records)?;
+                needs_review |= trust != Status::Verified;
                 rows.push(WebRow {
                     id: key,
-                    status: if in_place { "verified" } else { "ready" },
+                    status: if !in_place {
+                        "ready"
+                    } else {
+                        match trust {
+                            Status::Verified => "verified",
+                            Status::Valid => "valid",
+                            Status::Stale => "stale",
+                            Status::Invalid => "invalid",
+                        }
+                    },
                     error: None,
                     evidence: Some(evidence),
                 });
@@ -1380,6 +1682,7 @@ fn run_verify(
     provider_order: &[String],
     limit: usize,
     in_place: bool,
+    reviewed: Option<&Path>,
     compact: bool,
     mailto: Option<&str>,
     history_write: &HistoryWriteArgs,
@@ -1401,6 +1704,15 @@ fn run_verify(
     let mut output = original.clone();
     let mut rows = Vec::new();
     let mut needs_review = false;
+    let reviewed: Option<serde_json::Value> = reviewed
+        .map(|path| -> Result<_> {
+            let value: serde_json::Value = serde_json::from_str(&fs::read_to_string(path)?)?;
+            if !value.is_array() {
+                bail!("--reviewed requires a source verify JSON report");
+            }
+            Ok(value)
+        })
+        .transpose()?;
 
     for key in selected {
         let records = parse(&output)?;
@@ -1410,9 +1722,7 @@ fn run_verify(
             .cloned()
             .with_context(|| format!("citation key not found: {key}"))?;
         let summary = provenance::summary(&record, &records);
-        if status(&record, &records)? == Status::Verified
-            && summary.kind.as_deref() == Some("provider")
-        {
+        if status(&record, &records)? == Status::Verified {
             rows.push(VerifyRow {
                 id: key,
                 status: "already-verified",
@@ -1430,6 +1740,18 @@ fn run_verify(
             .fields
             .get("doi")
             .map(|doi| LiteratureIdentifier::Doi(doi.replace("\\_", "_")))
+            .or_else(|| {
+                let mut non_url = record.clone();
+                non_url.fields.remove("url");
+                let (identifier, candidate) = identifier_from_bibtex_fields(&non_url)?;
+                resolution = Some(ResolutionReport {
+                    input: candidate.evidence.input_url.clone(),
+                    status: "resolved",
+                    candidates: vec![candidate],
+                    warnings: vec![],
+                });
+                Some(identifier)
+            })
             .or_else(|| {
                 let url = record.fields.get("url")?;
                 if let Some(arxiv_id) = resolver::arxiv_id_in_url(url) {
@@ -1495,6 +1817,16 @@ fn run_verify(
                         None
                     }
                 }
+            })
+            .or_else(|| {
+                let (identifier, candidate) = identifier_from_bibtex_fields(&record)?;
+                resolution = Some(ResolutionReport {
+                    input: candidate.evidence.input_url.clone(),
+                    status: "resolved",
+                    candidates: vec![candidate],
+                    warnings: vec![],
+                });
+                Some(identifier)
             });
 
         if rows.last().is_some_and(|row| row.id == key) {
@@ -1511,6 +1843,26 @@ fn run_verify(
                     .expect("provider was opened before verification");
                 match backend.lookup(&identifier) {
                     Ok(fetched) => {
+                        if let Some(reviewed) = &reviewed {
+                            let candidate = reviewed
+                                .as_array()
+                                .expect("checked array")
+                                .iter()
+                                .find(|row| row["id"].as_str() == Some(key.as_str()))
+                                .and_then(|row| row["candidates"].as_array())
+                                .and_then(|rows| rows.first())
+                                .context("reviewed report has no exact replacement for this key")?;
+                            let after =
+                                biblock_cli::catalog::proposed_record(&record, &fetched.record);
+                            if candidate["baseline_hash"].as_str() != Some(hash(&record)?.as_str())
+                                || candidate["proposal_hash"].as_str()
+                                    != Some(hash(&after)?.as_str())
+                            {
+                                bail!(
+                                    "entry {key} or API metadata changed since dry run; review again"
+                                );
+                            }
+                        }
                         let provider_id = fetched.record.id.clone();
                         match reconcile_fetched(
                             &output,
@@ -1523,15 +1875,35 @@ fn run_verify(
                             true,
                         ) {
                             Ok((updated, _)) => {
+                                let updated_records = parse(&updated)?;
+                                let updated_record = updated_records
+                                    .iter()
+                                    .find(|record| record.entry_key == key)
+                                    .context("updated entry missing")?;
+                                let verified =
+                                    status(updated_record, &updated_records)? == Status::Verified;
+                                needs_review |= !verified;
                                 output = updated;
                                 rows.push(VerifyRow {
                                     id: key.clone(),
-                                    status: if in_place { "verified" } else { "ready" },
+                                    status: if !verified {
+                                        "needs-review"
+                                    } else if in_place {
+                                        "verified"
+                                    } else {
+                                        "ready"
+                                    },
                                     provider: Some(normalized),
                                     provider_id: Some(provider_id),
                                     error: None,
                                     resolution: resolution.clone(),
-                                    candidates: vec![],
+                                    candidates: vec![planned_candidate(
+                                        &record,
+                                        Candidate {
+                                            score: None,
+                                            record: fetched.record.clone(),
+                                        },
+                                    )],
                                 });
                                 applied = true;
                                 break;
@@ -1577,7 +1949,7 @@ fn run_verify(
         let Some(search_provider) = provider_order
             .iter()
             .map(|name| name.to_ascii_lowercase())
-            .find(|name| name == DEFAULT_PROVIDER)
+            .find(|name| name != providers::DOI_PROVIDER)
         else {
             needs_review = true;
             rows.push(VerifyRow {
@@ -1591,7 +1963,7 @@ fn run_verify(
             });
             continue;
         };
-        let query = BibliographicQuery::from_record(&record);
+        let query = title_query(&record);
         match backends[&search_provider].search(&query, limit) {
             Ok(search) => {
                 needs_review = true;
@@ -1674,8 +2046,15 @@ fn reconcile_fetched(
     );
     let mut fields = fetched.record.bibtex_fields();
     fields.insert(SOURCE_FIELD.to_owned(), provider_source.entry_key.clone());
-    let mut output = update_entry_fields_exact(
+    let without_approval = update_entry_fields_exact(
         source,
+        key,
+        fetched.record.bibtex_type(),
+        &BTreeMap::new(),
+        APPROVAL_FIELDS,
+    )?;
+    let mut output = update_entry_fields_exact(
+        &without_approval,
         key,
         fetched.record.bibtex_type(),
         &fields,
@@ -1704,54 +2083,13 @@ fn reconcile_fetched(
 fn identifier_from_bibtex_fields(
     record: &Record,
 ) -> Option<(LiteratureIdentifier, resolver::ResolutionCandidate)> {
-    for (field, value) in &record.fields {
-        if matches!(field.as_str(), "doi" | "url" | "integrity" | SOURCE_FIELD) {
-            continue;
-        }
-        if let Some((_, doi)) = resolver::identifiers_in_url(value).into_iter().next() {
-            let candidate = field_resolution_candidate(field, value, "doi", &doi);
-            return Some((LiteratureIdentifier::Doi(doi), candidate));
-        }
-        if let Some(arxiv_id) = resolver::arxiv_id_in_url(value) {
-            let candidate = field_resolution_candidate(field, value, "arxiv", &arxiv_id);
-            return Some((
-                LiteratureIdentifier::Doi(format!("10.48550/arXiv.{arxiv_id}")),
-                candidate,
-            ));
-        }
-    }
-    None
-}
-
-fn field_resolution_candidate(
-    field: &str,
-    value: &str,
-    kind: &str,
-    identifier: &str,
-) -> resolver::ResolutionCandidate {
-    let input = format!("{field}:{value}");
-    resolver::ResolutionCandidate {
-        kind: kind.to_owned(),
-        value: identifier.to_owned(),
-        confidence: resolver::ResolutionConfidence::Exact,
-        signals: vec![resolver::MatchSignal {
-            kind: format!("{kind}-in-{field}"),
-            value: identifier.to_owned(),
-        }],
-        evidence: resolver::ResolutionEvidence {
-            method: "bibtex-field".to_owned(),
-            input_url: input.clone(),
-            final_url: input,
-            request_url: None,
-            media_type: None,
-            response_sha256: None,
-            response_bytes: 0,
-        },
-    }
+    resolver::identifier_from_record(record)
 }
 
 fn planned_candidate(record: &Record, candidate: Candidate) -> PlannedCandidate {
     let similarity = dedupe::literature_similarity(record, &candidate.record);
+    let proposed = biblock_cli::catalog::proposed_record(record, &candidate.record);
+    let proposed = proposal::clean_record(&proposed).expect("serializable bibliography record");
     PlannedCandidate {
         provider_score: candidate.score,
         match_score: similarity.map(|value| value.score),
@@ -1759,6 +2097,9 @@ fn planned_candidate(record: &Record, candidate: Candidate) -> PlannedCandidate 
         author_score: similarity.map(|value| value.author_score),
         changes: changes(record, &candidate.record),
         record: candidate.record,
+        baseline_hash: hash(record).expect("serializable bibliography record"),
+        proposal_hash: hash(&proposed).expect("serializable bibliography record"),
+        proposed,
     }
 }
 
@@ -1851,11 +2192,17 @@ fn run_integrity(command: IntegrityCommand) -> Result<u8> {
                     println!("{}\t{}{}", row.status, row.id, origin);
                 }
             }
-            Ok(if rows.iter().all(|row| row.status == Status::Verified) {
-                0
-            } else {
-                3
-            })
+            let lock = history::status(&file, None)?;
+            if !lock.valid {
+                eprintln!("lockfile validation failed: {}", lock.errors.join("; "));
+            }
+            Ok(
+                if lock.valid && rows.iter().all(|row| row.status == Status::Verified) {
+                    0
+                } else {
+                    3
+                },
+            )
         }
         IntegrityCommand::Hash { file, key } => {
             let source = read_file(&file)?;

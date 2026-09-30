@@ -168,6 +168,61 @@ pub fn arxiv_id_in_url(input_url: &str) -> Option<String> {
     find_arxiv_id(input_url)
 }
 
+pub fn identifier_from_record(
+    record: &crate::bibtex::Record,
+) -> Option<(crate::catalog::LiteratureIdentifier, ResolutionCandidate)> {
+    for (field, value) in &record.fields {
+        if crate::history::is_workflow_field(field) {
+            continue;
+        }
+        let input = value.replace("\\_", "_");
+        let arxiv_input = if field == "eprint" {
+            format!("https://arxiv.org/abs/{}", input.trim())
+        } else {
+            input.clone()
+        };
+        let (kind, id) = if let Some((_, doi)) = identifiers_in_url(&input).into_iter().next() {
+            ("doi", doi)
+        } else if let Some(arxiv) = arxiv_id_in_url(&arxiv_input) {
+            ("arxiv", arxiv)
+        } else {
+            continue;
+        };
+        let identifier = crate::catalog::LiteratureIdentifier::Doi(if kind == "arxiv" {
+            format!("10.48550/arXiv.{id}")
+        } else {
+            id.clone()
+        });
+        let evidence_input = if field == "eprint" && kind == "arxiv" {
+            format!("eprint:{arxiv_input}")
+        } else {
+            format!("{field}:{input}")
+        };
+        return Some((
+            identifier,
+            ResolutionCandidate {
+                kind: kind.to_owned(),
+                value: id.clone(),
+                confidence: ResolutionConfidence::Exact,
+                signals: vec![MatchSignal {
+                    kind: format!("{kind}-in-bibtex-field:{field}"),
+                    value: id,
+                }],
+                evidence: ResolutionEvidence {
+                    method: "bibtex-field".to_owned(),
+                    input_url: evidence_input.clone(),
+                    final_url: evidence_input,
+                    request_url: None,
+                    media_type: None,
+                    response_sha256: None,
+                    response_bytes: 0,
+                },
+            },
+        ));
+    }
+    None
+}
+
 pub fn fetch_web_evidence(input: &str) -> Result<WebEvidence> {
     let input_url = normalize_input_url(input)?;
     let fetched = fetch_page(input_url, MAX_WEB_EVIDENCE_BYTES)?;

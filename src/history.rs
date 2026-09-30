@@ -17,7 +17,7 @@ use crate::integrity::{
 };
 use crate::provenance::{SOURCE_FIELD, SOURCE_TYPE};
 
-const LOCKFILE_VERSION: &str = "1.0";
+const LOCKFILE_VERSION: &str = "1.1";
 const WORKFLOW_FIELDS: &[&str] = &[
     INTEGRITY_FIELD,
     SOURCE_FIELD,
@@ -102,6 +102,10 @@ pub struct LockFile {
     pub entries: BTreeMap<String, EntryLock>,
     pub sources: BTreeMap<String, BTreeMap<String, serde_json::Value>>,
     pub revisions: BTreeMap<String, Revision>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deleted_entries: BTreeMap<String, EntryLock>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub proposals: BTreeMap<String, crate::proposal::Proposal>,
 }
 
 impl Default for LockFile {
@@ -113,6 +117,8 @@ impl Default for LockFile {
             entries: BTreeMap::new(),
             sources: BTreeMap::new(),
             revisions: BTreeMap::new(),
+            deleted_entries: BTreeMap::new(),
+            proposals: BTreeMap::new(),
         }
     }
 }
@@ -153,6 +159,10 @@ pub fn clean_source(source: &str) -> Result<String> {
     remove_fields(&without_entries, WORKFLOW_FIELDS)
 }
 
+pub fn is_workflow_field(field: &str) -> bool {
+    WORKFLOW_FIELDS.contains(&field)
+}
+
 pub fn preview(file: &Path, lock_override: Option<&Path>, proposed: &str) -> Result<LockFile> {
     let (mut lock, _) = read_lock(file, lock_override)?;
     import_embedded(proposed, &mut lock)?;
@@ -175,14 +185,36 @@ pub fn commit_edit(
         operation,
         actor,
         false,
+        None,
     )
 }
 
 pub fn approve(file: &Path, keys: &BTreeSet<String>, reviewer: Option<&str>) -> Result<usize> {
+    approve_bound(file, keys, reviewer, None)
+}
+
+pub fn approve_bound(
+    file: &Path,
+    keys: &BTreeSet<String>,
+    reviewer: Option<&str>,
+    hashes: Option<&BTreeMap<String, String>>,
+) -> Result<usize> {
     if keys.is_empty() {
         return Ok(0);
     }
     let expected = hydrate_file(file)?;
+    if let Some(hashes) = hashes {
+        let records = parse(&expected)?;
+        for key in keys {
+            let current = records
+                .iter()
+                .find(|record| record.entry_key == *key)
+                .context("entry not found")?;
+            if hashes.get(key) != Some(&hash(current)?) {
+                bail!("entry {key} changed since review; refresh and review it again");
+            }
+        }
+    }
     let proposed = add_approvals(file, &expected, keys, reviewer)?;
     let actor = reviewer
         .map(str::trim)
@@ -214,6 +246,79 @@ pub fn commit_human_edit(
         .filter(|value| !value.is_empty())
         .unwrap_or("anonymous-browser-review");
     commit_edit(file, None, expected, &approved, operation, Some(actor))
+}
+
+pub(crate) fn commit_proposal(
+    file: &Path,
+    expected: &str,
+    proposed: &str,
+    id: &str,
+    reviewer: Option<&str>,
+    decision: crate::proposal::Decision,
+) -> Result<bool> {
+    let lock = read_required_lock(file, None)?;
+    let key = &lock.proposals.get(id).context("proposal not found")?.target;
+    let approved = add_approvals(file, proposed, &BTreeSet::from([key.clone()]), reviewer)?;
+    commit_edit_inner(
+        file,
+        None,
+        expected,
+        &approved,
+        "proposal-adopt",
+        Some(
+            reviewer
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("anonymous-browser-review"),
+        ),
+        false,
+        Some((id, decision)),
+    )
+}
+
+pub(crate) fn commit_provider_proposal(
+    file: &Path,
+    expected: &str,
+    proposed: &str,
+    id: &str,
+    agent: &str,
+    decision: crate::proposal::Decision,
+) -> Result<bool> {
+    commit_edit_inner(
+        file,
+        None,
+        expected,
+        proposed,
+        "proposal-adopt",
+        Some(agent),
+        false,
+        Some((id, decision)),
+    )
+}
+
+pub(crate) fn update_lock(
+    file: &Path,
+    update: impl FnOnce(&mut LockFile) -> Result<()>,
+) -> Result<()> {
+    let report = status(file, None)?;
+    if !report.valid {
+        bail!(
+            "lockfile is not current: {}; run `biblock lock FILE --sync` after reviewing external edits",
+            report.errors.join("; ")
+        );
+    }
+    let (mut lock, raw) = read_lock(file, None)?;
+    update(&mut lock)?;
+    lock.lockfile_version = LOCKFILE_VERSION.to_owned();
+    validate_lock(&lock)?;
+    let path = default_path(file);
+    if fs::read_to_string(&path).ok() != raw || !status(file, None)?.valid {
+        bail!("bibliography or lockfile changed; retry the command");
+    }
+    atomic_write(
+        &path,
+        &format!("{}\n", serde_json::to_string_pretty(&lock)?),
+    )
 }
 
 fn add_approvals(
@@ -282,6 +387,7 @@ pub fn sync(
         "lock-sync",
         actor,
         true,
+        None,
     )?;
     status(file, lock_override)
 }
@@ -295,6 +401,7 @@ fn commit_edit_inner(
     operation: &str,
     actor: Option<&str>,
     allow_stale: bool,
+    decision: Option<(&str, crate::proposal::Decision)>,
 ) -> Result<bool> {
     let lock_path = lock_override
         .map(Path::to_path_buf)
@@ -341,13 +448,16 @@ fn commit_edit_inner(
         .collect();
     let mut changed = false;
     for key in keys {
-        let old = old_lock.entries.get(&key);
+        let old = old_lock
+            .entries
+            .get(&key)
+            .or_else(|| old_lock.deleted_entries.get(&key));
         let new = next_lock.entries.get(&key);
-        if equivalent_state(old, new) {
+        if equivalent_state(old, new) && !old_lock.deleted_entries.contains_key(&key) {
             continue;
         }
         changed = true;
-        if let (Some(old), Some(_)) = (old, new)
+        if let Some(old) = old
             && let Some(snapshot) = old.snapshot.clone()
         {
             let (revision_id, revision) = make_revision(
@@ -360,16 +470,42 @@ fn commit_edit_inner(
                 &next_lock.revisions,
             )?;
             next_lock.revisions.insert(revision_id.clone(), revision);
-            next_lock
-                .entries
-                .get_mut(&key)
-                .expect("new entry exists")
-                .head = Some(revision_id);
+            if let Some(entry) = next_lock.entries.get_mut(&key) {
+                entry.head = Some(revision_id);
+                next_lock.deleted_entries.remove(&key);
+            } else {
+                let mut deleted = old.clone();
+                deleted.head = Some(revision_id);
+                next_lock.deleted_entries.insert(key.clone(), deleted);
+            }
         }
     }
     if old_lock.sources != next_lock.sources {
         changed = true;
     }
+    if let Some((id, mut decision)) = decision {
+        let proposal = next_lock
+            .proposals
+            .get_mut(id)
+            .context("proposal not found")?;
+        if proposal.decision.is_some() {
+            bail!("proposal has already been decided");
+        }
+        let next_head = next_lock
+            .entries
+            .get(&proposal.target)
+            .and_then(|entry| entry.head.clone());
+        let previous_head = old_lock
+            .entries
+            .get(&proposal.target)
+            .and_then(|entry| entry.head.clone());
+        if next_head != previous_head {
+            decision.revision = next_head;
+        }
+        proposal.decision = Some(decision);
+        changed = true;
+    }
+    next_lock.lockfile_version = LOCKFILE_VERSION.to_owned();
     if !changed && raw_main == clean && old_lock_raw.is_some() {
         return Ok(false);
     }
@@ -413,6 +549,7 @@ pub fn status(file: &Path, lock_override: Option<&Path>) -> Result<HistoryStatus
     }
     let clean = clean_source(&source)?;
     let mut errors = validation_errors(&lock);
+    let structural_invalid = !errors.is_empty();
     if lock.bibliography.content_hash != document_hash(&clean)? {
         errors.push("bibliography content hash does not match".to_owned());
     }
@@ -437,7 +574,13 @@ pub fn status(file: &Path, lock_override: Option<&Path>) -> Result<HistoryStatus
     errors.sort();
     errors.dedup();
     let referenced = referenced_revisions(&lock);
-    let state = if errors.is_empty() { "locked" } else { "stale" };
+    let state = if errors.is_empty() {
+        "locked"
+    } else if structural_invalid {
+        "invalid"
+    } else {
+        "stale"
+    };
     Ok(HistoryStatus {
         valid: errors.is_empty(),
         state,
@@ -454,6 +597,7 @@ pub fn log(file: &Path, lock_override: Option<&Path>, key: &str) -> Result<Vec<R
     let entry = lock
         .entries
         .get(key)
+        .or_else(|| lock.deleted_entries.get(key))
         .with_context(|| format!("citation key not found: {key}"))?;
     let mut next = entry.head.as_deref();
     let mut seen = BTreeSet::new();
@@ -504,7 +648,14 @@ pub fn restore_record(
     let (_, revision) = resolve_revision(&lock, revision)?;
     let mut replacement = revision.snapshot.clone();
     apply_state_fields(&mut replacement, &revision.state);
-    crate::integrity::replace_entry(source, &replacement)
+    if parse(source)?
+        .iter()
+        .any(|record| record.entry_key == replacement.entry_key)
+    {
+        crate::integrity::replace_entry(source, &replacement)
+    } else {
+        Ok(format!("{source}\n{}", render(&[replacement])?))
+    }
 }
 
 fn hydrate_file_with_override(file: &Path, lock_override: Option<&Path>) -> Result<String> {
@@ -838,7 +989,7 @@ fn read_lock(file: &Path, lock_override: Option<&Path>) -> Result<(LockFile, Opt
     }
 }
 
-fn read_required_lock(file: &Path, lock_override: Option<&Path>) -> Result<LockFile> {
+pub(crate) fn read_required_lock(file: &Path, lock_override: Option<&Path>) -> Result<LockFile> {
     let (lock, raw) = read_lock(file, lock_override)?;
     raw.context("lockfile is missing")?;
     validate_lock(&lock)?;
@@ -856,7 +1007,7 @@ fn validate_lock(lock: &LockFile) -> Result<()> {
 
 fn validation_errors(lock: &LockFile) -> Vec<String> {
     let mut errors = Vec::new();
-    if lock.lockfile_version != LOCKFILE_VERSION {
+    if !matches!(lock.lockfile_version.as_str(), "1.0" | LOCKFILE_VERSION) {
         errors.push(format!(
             "unsupported lockfileVersion {}",
             lock.lockfile_version
@@ -865,12 +1016,35 @@ fn validation_errors(lock: &LockFile) -> Vec<String> {
     if lock.tool_version.trim().is_empty() {
         errors.push("toolVersion is empty".to_owned());
     }
-    for (key, entry) in &lock.entries {
+    for (key, entry) in lock.entries.iter().chain(&lock.deleted_entries) {
+        if lock.entries.contains_key(key) && lock.deleted_entries.contains_key(key) {
+            errors.push(format!("entry {key} is both active and deleted"));
+        }
+        if let Some(head) = &entry.head {
+            match lock.revisions.get(head) {
+                Some(revision) if revision.target == *key => {}
+                Some(_) => errors.push(format!("entry {key} head belongs to another target")),
+                None => errors.push(format!("entry {key} references missing revision {head}")),
+            }
+            let mut seen = BTreeSet::new();
+            let mut next = Some(head.as_str());
+            while let Some(id) = next {
+                if !seen.insert(id) {
+                    errors.push(format!("entry {key} history cycle at {id}"));
+                    break;
+                }
+                next = lock
+                    .revisions
+                    .get(id)
+                    .and_then(|revision| revision.previous.as_deref());
+            }
+        }
         if !is_sha256(&entry.content_hash) {
             errors.push(format!("entry {key} has invalid contentHash"));
         }
         if let Some(snapshot) = &entry.snapshot
-            && hash(snapshot).ok().as_ref() != Some(&entry.content_hash)
+            && (snapshot.entry_key != *key
+                || hash(snapshot).ok().as_ref() != Some(&entry.content_hash))
         {
             errors.push(format!("entry {key} snapshot hash does not match"));
         }
@@ -905,6 +1079,14 @@ fn validation_errors(lock: &LockFile) -> Vec<String> {
         }
     }
     for (id, revision) in &lock.revisions {
+        if revision.snapshot.entry_key != revision.target {
+            errors.push(format!("revision {id} snapshot belongs to another target"));
+        }
+        if let Some(source) = &revision.state.source
+            && !lock.sources.contains_key(source)
+        {
+            errors.push(format!("revision {id} references missing source {source}"));
+        }
         let snapshot_hash = sha256(
             &serde_json::to_vec(&(revision.snapshot.clone(), revision.state.clone()))
                 .unwrap_or_default(),
@@ -940,6 +1122,25 @@ fn validation_errors(lock: &LockFile) -> Vec<String> {
             }
         }
     }
+    for (id, proposal) in &lock.proposals {
+        if let Err(error) = proposal.validate(id) {
+            errors.push(format!("proposal {id}: {error:#}"));
+        }
+        if let Some(revision_id) = proposal
+            .decision
+            .as_ref()
+            .and_then(|decision| decision.revision.as_ref())
+        {
+            match lock.revisions.get(revision_id) {
+                Some(revision)
+                    if revision.target == proposal.target
+                        && revision.snapshot == proposal.before => {}
+                _ => errors.push(format!(
+                    "proposal {id} decision references an invalid adoption revision"
+                )),
+            }
+        }
+    }
     errors.sort();
     errors.dedup();
     errors
@@ -947,7 +1148,7 @@ fn validation_errors(lock: &LockFile) -> Vec<String> {
 
 fn referenced_revisions(lock: &LockFile) -> BTreeSet<&str> {
     let mut referenced = BTreeSet::new();
-    for entry in lock.entries.values() {
+    for entry in lock.entries.values().chain(lock.deleted_entries.values()) {
         let mut next = entry.head.as_deref();
         while let Some(id) = next {
             if !referenced.insert(id) {

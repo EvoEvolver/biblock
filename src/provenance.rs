@@ -672,7 +672,7 @@ fn validate_selection(source: &Record, records: &[Record]) -> Result<()> {
     }
     if !matches!(
         required(source, "method")?,
-        "agent-review" | "browser-review"
+        "agent-review" | "browser-review" | "agent-proposal"
     ) {
         bail!("unsupported selection method");
     }
@@ -935,7 +935,7 @@ fn evidence_identity(fields: &BTreeMap<String, String>) -> String {
     sha256(&input)
 }
 
-fn projection_hash(entry_type: &str, fields: &BTreeMap<String, String>) -> String {
+pub(crate) fn projection_hash(entry_type: &str, fields: &BTreeMap<String, String>) -> String {
     let payload = (entry_type.to_ascii_lowercase(), fields);
     sha256(&serde_json::to_vec(&payload).expect("string projection is always serializable"))
 }

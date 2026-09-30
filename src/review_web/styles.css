@@ -123,7 +123,7 @@ button.primary { color: #fff; background: var(--blue); border-color: var(--blue)
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
   line-height: 1.45;
 }
-.editor-actions { display: flex; gap: 8px; margin-top: 9px; }
+.editor-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 9px; }
 .bibtex-editor .comparison-wrap { margin-top: 10px; }
 .bibtex-editor .primary { margin-top: 10px; }
 .form-error { color: var(--red); }
@@ -149,8 +149,6 @@ button.primary { color: #fff; background: var(--blue); border-color: var(--blue)
 .candidate > button { margin-top: 12px; }
 
 .detail-actions {
-  position: sticky;
-  bottom: -28px;
   display: flex;
   gap: 10px;
   margin-top: 20px;
@@ -174,6 +172,8 @@ button.primary { color: #fff; background: var(--blue); border-color: var(--blue)
   .entry-list { max-height: 42vh; border-right: 0; border-bottom: 1px solid var(--line); }
   .detail { min-height: 48vh; padding: 22px 16px; }
   .summary-field { grid-template-columns: 90px 1fr; }
-  .detail-actions { bottom: 0; }
   .candidate-head { display: block; }
 }
+.agent-proposal { border-top: 1px solid var(--line); padding-top: 16px; margin-top: 20px; }
+.agent-proposal-history { margin-top: 18px; }
+.proposal-evidence { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }

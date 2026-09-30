@@ -48,7 +48,7 @@ function visibleEntries() {
   return view.data.entries.filter((entry) => {
     const matchesFilter =
       view.filter === "all" ||
-      (view.filter === "pending" && entry.status !== "verified") ||
+      (view.filter === "pending" && (entry.status !== "verified" || pendingProposals(entry.id).length)) ||
       entry.status === view.filter;
     const searchable = [entry.id, entry.title, entry.authors, entry.year]
       .filter(Boolean)
@@ -58,9 +58,14 @@ function visibleEntries() {
   });
 }
 
+function pendingProposals(key) {
+  return view.data.proposals.filter((proposal) => proposal.target === key && !proposal.decision);
+}
+
 function render() {
   ui.file.textContent = view.data.file;
-  ui.progress.textContent = `${view.data.verified} / ${view.data.total} verified`;
+  const proposals = view.data.proposals.filter((proposal) => !proposal.decision).length;
+  ui.progress.textContent = `${view.data.verified} / ${view.data.total} verified${proposals ? ` · ${proposals} proposal(s) pending` : ""}`;
   renderList();
   renderDetail();
   renderSelectionControls();
@@ -85,6 +90,7 @@ function renderList() {
 
     const summary = element("div");
     summary.append(element("div", "entry-title", entry.title || entry.id));
+    if (pendingProposals(entry.id).length) summary.append(element("div", "meta", `${pendingProposals(entry.id).length} agent proposal(s)`));
     summary.append(
       element("div", "meta", [entry.id, entry.authors, entry.year].filter(Boolean).join(" · ")),
     );
@@ -111,25 +117,89 @@ function renderDetail() {
 
   ui.detail.append(element("h1", "", entry.title || "Untitled entry"));
   ui.detail.append(element("div", "citation-key", entry.id));
-  const evidence = entry.source.valid ? "Valid" : `Invalid: ${entry.source.error || "unknown error"}`;
+  const humanApproved = entry.approval && entry.approval.contentHash === entry.contentHash;
+  const evidence = entry.approval
+    ? humanApproved ? "Valid human approval" : "Approval no longer matches current content"
+    : entry.source.valid ? "Valid" : `Invalid: ${entry.source.error || "unknown error"}`;
   for (const [label, value] of [
     ["Status", entry.status],
     ["Entry type", entry.entryType],
-    ["Source kind", entry.source.kind],
-    ["Source key", entry.source.key],
+    ["Source kind", humanApproved ? "human" : entry.source.kind],
+    ["Source key", humanApproved ? entry.approval.id : entry.source.key],
     ["Evidence", evidence],
   ]) {
     ui.detail.append(summaryField(label, value || "—"));
   }
+  if (entry.approval) ui.detail.append(summaryField("Reviewer", entry.approval.reviewer || "Anonymous"));
 
   const fields = element("section", "all-fields");
   fields.append(element("h2", "", "Current BibTeX fields"));
   fields.append(singleFieldTable(entry.fields));
   ui.detail.append(fields);
 
+  const proposals = view.data.proposals.filter((proposal) => proposal.target === entry.id)
+    .sort((left, right) => Number(Boolean(left.decision)) - Number(Boolean(right.decision)));
+  for (const proposal of proposals) {
+    if (proposal.decision) {
+      const history = element("details", "agent-proposal-history");
+      history.append(element("summary", "", `Agent proposal: ${proposal.decision.outcome} · ${proposal.agent}`));
+      history.append(proposalView(proposal));
+      ui.detail.append(history);
+    } else ui.detail.append(proposalView(proposal));
+  }
+
   if (entry.status !== "verified") ui.detail.append(providerSearch(entry));
   ui.detail.append(bibtexEditor(entry));
   ui.detail.append(detailActions(entry));
+}
+
+function proposalView(proposal) {
+  const section = element("section", "agent-proposal");
+  section.append(element("h2", "", "Agent proposal"));
+  section.append(summaryField("Agent", proposal.agent));
+  section.append(summaryField("Reason", proposal.reason));
+  if (proposal.provider) {
+    section.append(summaryField("Provider", `${proposal.provider.record.provider}: ${proposal.provider.record.id}`));
+    section.append(summaryField("Title / author match", proposal.matchScore ? `${proposal.matchScore.score} (title ${proposal.matchScore.title_score}, author ${proposal.matchScore.author_score}; threshold ${proposal.provider.threshold})` : "Cannot be scored"));
+    section.append(summaryField("Agent adoption", proposal.agentAdoptable ? "Eligible after agent review" : (proposal.agentAdoptionBlocker || "Already decided")));
+  } else section.append(summaryField("Provider support", "None; human approval required"));
+  if (proposal.decision?.agent) section.append(summaryField("Adopted by agent", proposal.decision.agent));
+  section.append(summaryField("Created", new Date(proposal.timestamp * 1000).toLocaleString()));
+  section.append(summaryField("Decision", proposal.decision?.outcome || (proposal.stale ? "Stale baseline" : "Pending")));
+  const before = { ENTRYTYPE: proposal.before.entry_type, ...proposal.before.fields };
+  const after = { ENTRYTYPE: proposal.after.entry_type, ...proposal.after.fields };
+  const rows = [...new Set([...Object.keys(before), ...Object.keys(after)])].sort().map((field) => ({
+    field,
+    current: before[field] ?? null,
+    proposed: after[field] ?? null,
+    state: before[field] === after[field] ? "unchanged" : !(field in before) ? "added" : !(field in after) ? "removed" : "changed",
+  }));
+  section.append(comparisonTable(rows, "Before proposal", "Agent replacement"));
+  if (proposal.provider || proposal.evidence !== null) {
+    const details = element("details");
+    details.append(element("summary", "", "Supporting evidence"));
+    details.append(element("pre", "proposal-evidence", JSON.stringify(proposal.provider || proposal.evidence, null, 2)));
+    section.append(details);
+  }
+  if (!proposal.decision) {
+    const actions = element("div", "editor-actions");
+    const adopt = element("button", "primary", "Adopt proposal and approve");
+    adopt.disabled = proposal.stale;
+    adopt.addEventListener("click", () => decideProposal(proposal.id, true));
+    const reject = element("button", "", "Reject proposal");
+    reject.addEventListener("click", () => decideProposal(proposal.id, false));
+    actions.append(adopt, reject);
+    section.append(actions);
+  }
+  return section;
+}
+
+async function decideProposal(id, adopt) {
+  try {
+    view.data = await post("/api/proposal", { id, adopt, reviewer: ui.reviewer.value });
+    notify(adopt ? "Proposal adopted and human-verified" : "Proposal rejected");
+    render();
+  } catch (error) { notify(error.message, true); }
 }
 
 function summaryField(label, value) {
@@ -194,11 +264,13 @@ function bibtexEditor(entry) {
   const controls = element("div", "editor-actions");
   const previewButton = element("button", "", "Preview pasted entry");
   const preview = element("div");
+  textarea.addEventListener("input", () => preview.replaceChildren());
   previewButton.addEventListener("click", async () => {
     preview.replaceChildren(element("p", "meta", "Parsing BibTeX…"));
     try {
-      const result = await post("/api/bibtex/preview", { key: entry.id, bibtex: textarea.value });
-      if (view.activeKey !== entry.id) return;
+      const bibtex = textarea.value;
+      const result = await post("/api/bibtex/preview", { key: entry.id, bibtex });
+      if (view.activeKey !== entry.id || textarea.value !== bibtex) return;
       preview.replaceChildren();
       const keyMessage = result.pastedKey === entry.id
         ? `Citation key: ${entry.id}`
@@ -206,7 +278,7 @@ function bibtexEditor(entry) {
       preview.append(element("p", "meta", `@${result.entryType} · ${keyMessage}`));
       preview.append(comparisonTable(result.comparison, "Current", "Pasted BibTeX"));
       const apply = element("button", "primary", "Use pasted BibTeX and approve");
-      apply.addEventListener("click", () => applyPastedBibtex(entry.id, textarea.value));
+      apply.addEventListener("click", () => applyPastedBibtex(entry.id, bibtex, result));
       preview.append(apply);
     } catch (error) {
       preview.replaceChildren(element("p", "form-error", error.message));
@@ -271,7 +343,7 @@ function candidateView(entry, provider, candidate) {
   );
   card.append(comparisonTable(candidate.comparison, "Current", provider.label));
   const adopt = element("button", "primary", `Adopt ${provider.label} record`);
-  adopt.addEventListener("click", () => adoptCandidate(entry.id, candidate.record.id, provider));
+  adopt.addEventListener("click", () => adoptCandidate(entry.id, candidate.record.id, provider, candidate.previewHash));
   card.append(adopt);
   return card;
 }
@@ -284,7 +356,7 @@ function detailActions(entry) {
     actions.append(open);
   }
   const approve = element("button", "", "Approve current entry");
-  approve.disabled = entry.status === "verified";
+  approve.disabled = entry.status === "verified" || pendingProposals(entry.id).length > 0;
   approve.addEventListener("click", () => approveKeys([entry.id]));
   actions.append(approve);
   return actions;
@@ -300,7 +372,8 @@ function renderSelectionControls() {
 
 async function approveKeys(keys) {
   try {
-    view.data = await post("/api/approve", { keys, reviewer: ui.reviewer.value });
+    const hashes = Object.fromEntries(keys.map((key) => [key, view.data.entries.find((entry) => entry.id === key).contentHash]));
+    view.data = await post("/api/approve", { keys, hashes, reviewer: ui.reviewer.value });
     keys.forEach((key) => view.selectedKeys.delete(key));
     notify(`Approved ${keys.length} ${keys.length === 1 ? "entry" : "entries"}`);
     render();
@@ -309,13 +382,14 @@ async function approveKeys(keys) {
   }
 }
 
-async function adoptCandidate(key, id, provider) {
+async function adoptCandidate(key, id, provider, previewHash) {
   try {
     view.data = await post("/api/adopt", {
       key,
       id,
       provider: provider.id,
       reviewer: ui.reviewer.value,
+      preview_hash: previewHash,
     });
     view.selectedKeys.delete(key);
     notify(`${provider.label} record adopted and provider-verified`);
@@ -325,12 +399,14 @@ async function adoptCandidate(key, id, provider) {
   }
 }
 
-async function applyPastedBibtex(key, bibtex) {
+async function applyPastedBibtex(key, bibtex, preview) {
   try {
     view.data = await post("/api/bibtex/apply", {
       key,
       bibtex,
       reviewer: ui.reviewer.value,
+      baseline_hash: preview.baselineHash,
+      proposal_hash: preview.proposalHash,
     });
     view.selectedKeys.delete(key);
     notify("Pasted BibTeX saved and human-verified");
@@ -364,7 +440,7 @@ function bindEvents() {
   });
   ui.approveSelected.addEventListener("click", () => approveKeys([...view.selectedKeys]));
   ui.approveAll.addEventListener("click", () => {
-    const keys = view.data.entries.filter((entry) => entry.status !== "verified").map((entry) => entry.id);
+    const keys = view.data.entries.filter((entry) => entry.status !== "verified" && !pendingProposals(entry.id).length).map((entry) => entry.id);
     const reviewer = ui.reviewer.value.trim() || "Anonymous";
     if (window.confirm(`Approve all ${keys.length} remaining entries as ${reviewer}?`)) approveKeys(keys);
   });
@@ -380,7 +456,8 @@ async function start() {
     view.data = await api("/api/state");
     ui.reviewer.value = view.data.reviewerDefault;
     view.activeKey =
-      view.data.entries.find((entry) => entry.status !== "verified")?.id || view.data.entries[0]?.id;
+    view.data.entries.find((entry) => pendingProposals(entry.id).length)?.id ||
+    view.data.entries.find((entry) => entry.status !== "verified")?.id || view.data.entries[0]?.id;
     render();
   } catch (error) {
     notify(error.message, true);

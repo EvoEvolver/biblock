@@ -25,6 +25,439 @@ const SAMPLE: &str = r#"% retained comment
 "#;
 
 #[test]
+fn frozen_provider_proposals_require_review_and_adopt_offline_as_api_verified() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("refs.bib");
+    let original =
+        "@article{one, title={Example work}, author={Doe, Jane}, note={Local note}, pages={1--2}}";
+    fs::write(&file, original).unwrap();
+    history::sync(&file, None, false, false, None).unwrap();
+    history::approve(&file, &BTreeSet::from(["one".into()]), Some("Alice")).unwrap();
+    let before_proposal = fs::read_to_string(&file).unwrap();
+    let base = mock_crossref_many(vec![
+        r#"{"message":{"items":[{"DOI":"10.1234/test","type":"journal-article","title":["Example work"],"author":[{"family":"Doe","given":"Jane"}]}]}}"#,
+        r#"{"message":{"DOI":"10.1234/test","type":"journal-article","title":["Example work"],"author":[{"family":"Doe","given":"Jane"}],"published":{"date-parts":[[2026]]}}}"#,
+    ]);
+    let output = Command::cargo_bin("biblock")
+        .unwrap()
+        .env("BIBLOCK_CROSSREF_API_BASE", base)
+        .args(["source", "propose"])
+        .arg(&file)
+        .args(["--key", "one", "--id", "10.1234/test", "--agent", "codex"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let proposal: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let id = proposal["id"].as_str().unwrap();
+    assert_eq!(proposal["agentAdoptable"], true);
+    assert_eq!(proposal["matchScore"]["score"], 1.0);
+    assert_eq!(fs::read_to_string(&file).unwrap(), before_proposal);
+    assert_eq!(proposal["after"]["fields"]["note"], "Local note");
+    assert!(proposal["after"]["fields"]["pages"].is_null());
+    let mut tampered = biblock_cli::proposal::list(&file)
+        .unwrap()
+        .remove(0)
+        .proposal;
+    tampered
+        .after
+        .fields
+        .insert("title".into(), "Invented replacement".into());
+    assert!(tampered.validate(id).is_err());
+    fs::write(
+        &file,
+        "@article{one, title={External edit}, author={Doe, Jane}}",
+    )
+    .unwrap();
+    assert!(biblock_cli::proposal::adopt(&file, id, "codex", true).is_err());
+    fs::write(&file, &before_proposal).unwrap();
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["proposal", "adopt"])
+        .arg(&file)
+        .args(["--id", id, "--agent", "codex"])
+        .assert()
+        .failure();
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["diagnosis"])
+        .arg(&file)
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("--reviewed"));
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["proposal", "adopt"])
+        .arg(&file)
+        .args(["--id", id, "--agent", "codex", "--reviewed"])
+        .assert()
+        .success();
+    let lock = read_lock(&file);
+    assert!(lock["entries"]["one"]["approval"].is_null());
+    assert_eq!(lock["entries"]["one"]["provider"], "crossref");
+    assert_eq!(lock["proposals"][id]["decision"]["agent"], "codex");
+    assert!(lock["proposals"][id]["decision"]["reviewer"].is_null());
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["diagnosis"])
+        .arg(&file)
+        .assert()
+        .success();
+    assert!(biblock_cli::proposal::adopt(&file, id, "codex", true).is_err());
+}
+
+#[test]
+fn ambiguous_and_low_score_provider_proposals_require_human_review() {
+    for (title, ambiguous) in [("Example work", true), ("Different subject", false)] {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("refs.bib");
+        fs::write(
+            &file,
+            format!("@article{{one, title={{{title}}}, author={{Doe, Jane}}}}"),
+        )
+        .unwrap();
+        history::sync(&file, None, false, false, None).unwrap();
+        let search = if ambiguous {
+            r#"{"message":{"items":[{"DOI":"10.1234/test","title":["Example work"],"author":[{"family":"Doe","given":"Jane"}]},{"DOI":"10.1234/other","title":["Example work"],"author":[{"family":"Doe","given":"Jane"}]}]}}"#
+        } else {
+            r#"{"message":{"items":[{"DOI":"10.1234/test","title":["Example work"],"author":[{"family":"Doe","given":"Jane"}]}]}}"#
+        };
+        let base = mock_crossref_many(vec![
+            search,
+            r#"{"message":{"DOI":"10.1234/test","title":["Example work"],"author":[{"family":"Doe","given":"Jane"}]}}"#,
+        ]);
+        let output = Command::cargo_bin("biblock")
+            .unwrap()
+            .env("BIBLOCK_CROSSREF_API_BASE", base)
+            .args(["source", "propose"])
+            .arg(&file)
+            .args(["--key", "one", "--id", "10.1234/test", "--agent", "codex"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let proposal: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(proposal["agentAdoptable"], false);
+        let id = proposal["id"].as_str().unwrap();
+        assert!(biblock_cli::proposal::adopt(&file, id, "codex", true).is_err());
+        biblock_cli::proposal::decide(&file, id, true, Some("Alice")).unwrap();
+        Command::cargo_bin("biblock")
+            .unwrap()
+            .args(["diagnosis"])
+            .arg(&file)
+            .assert()
+            .success();
+    }
+}
+
+#[test]
+fn agent_proposal_is_lock_only_and_human_adoption_is_reversible() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("refs.bib");
+    let original = "@article{one, title={Old}, pages={1--2}, year={2020}}\n";
+    fs::write(&file, original).unwrap();
+    history::sync(&file, None, false, false, None).unwrap();
+    let replacement = directory.path().join("new.bib");
+    fs::write(
+        &replacement,
+        "@book{different, title={New}, author={Doe, Jane}, year={2026}}",
+    )
+    .unwrap();
+    let output = Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["proposal", "create"])
+        .arg(&file)
+        .args([
+            "--key",
+            "one",
+            "--agent",
+            "codex",
+            "--reason",
+            "Corrected against publisher",
+        ])
+        .arg("--bibtex")
+        .arg(&replacement)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let proposal: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let id = proposal["id"].as_str().unwrap();
+    assert!(!proposal["agentAdoptable"].as_bool().unwrap());
+    assert!(biblock_cli::proposal::adopt(&file, id, "codex", true).is_err());
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
+    assert!(read_lock(&file)["entries"]["one"]["approval"].is_null());
+    assert!(
+        proposal["comparison"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["field"] == "pages" && change["proposed"].is_null())
+    );
+    assert_eq!(proposal["after"]["entry_key"], "one");
+    biblock_cli::proposal::decide(&file, id, true, Some("Alice")).unwrap();
+    let lock = read_lock(&file);
+    assert_eq!(lock["proposals"][id]["decision"]["outcome"], "adopted");
+    assert_eq!(lock["entries"]["one"]["approval"]["reviewer"], "Alice");
+    assert!(!fs::read_to_string(&file).unwrap().contains("bibapproval"));
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["diagnosis"])
+        .arg(&file)
+        .assert()
+        .success();
+    assert!(biblock_cli::proposal::decide(&file, id, true, None).is_err());
+    let revisions = history::log(&file, None, "one").unwrap();
+    assert_eq!(revisions[0].operation, "proposal-adopt");
+    assert_eq!(
+        lock["proposals"][id]["decision"]["revision"],
+        revisions[0].id
+    );
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["history", "restore"])
+        .arg(&file)
+        .args(["--revision", &revisions[0].id, "--in-place"])
+        .assert()
+        .success();
+    assert!(fs::read_to_string(&file).unwrap().contains("Old"));
+    assert_eq!(
+        read_lock(&file)["proposals"][id]["decision"]["outcome"],
+        "adopted"
+    );
+}
+
+#[test]
+fn stale_proposals_cannot_be_adopted_and_rejections_are_retained() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("refs.bib");
+    fs::write(&file, "@article{one, title={Old}}").unwrap();
+    history::sync(&file, None, false, false, None).unwrap();
+    history::approve(&file, &BTreeSet::from(["one".to_owned()]), Some("Alice")).unwrap();
+    let proposal = biblock_cli::proposal::create(
+        &file,
+        "one",
+        "@book{x, title={New}}",
+        "codex",
+        "Correction",
+        serde_json::json!({"url":"https://example.org"}),
+    )
+    .unwrap();
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["diagnosis"])
+        .arg(&file)
+        .assert()
+        .code(3);
+    fs::write(&file, "@article{one, title={External change}}").unwrap();
+    history::sync(&file, None, false, false, None).unwrap();
+    assert!(biblock_cli::proposal::list(&file).unwrap()[0].stale);
+    assert!(biblock_cli::proposal::decide(&file, &proposal.id, true, None).is_err());
+    biblock_cli::proposal::decide(&file, &proposal.id, false, Some(" ")).unwrap();
+    let lock = read_lock(&file);
+    assert_eq!(
+        lock["proposals"][&proposal.id]["decision"]["outcome"],
+        "rejected"
+    );
+    assert!(lock["proposals"][&proposal.id]["decision"]["reviewer"].is_null());
+    assert!(
+        fs::read_to_string(&file)
+            .unwrap()
+            .contains("External change")
+    );
+}
+
+#[test]
+fn history_checks_heads_and_preserves_deleted_entries_for_restore() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("refs.bib");
+    fs::write(
+        &file,
+        "@article{one, title={One}}\n@article{two, title={Two}}\n",
+    )
+    .unwrap();
+    history::sync(&file, None, false, false, None).unwrap();
+    history::approve(
+        &file,
+        &BTreeSet::from(["one".to_owned(), "two".to_owned()]),
+        Some("Alice"),
+    )
+    .unwrap();
+    let valid_lock = fs::read_to_string(lock_path(&file)).unwrap();
+    let mut tampered = read_lock(&file);
+    tampered["entries"]["one"]["head"] = "rev:deadbeef".into();
+    fs::write(lock_path(&file), serde_json::to_string(&tampered).unwrap()).unwrap();
+    assert!(!history::status(&file, None).unwrap().valid);
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["diagnosis"])
+        .arg(&file)
+        .assert()
+        .code(3);
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(&file)
+        .assert()
+        .code(3);
+    fs::write(lock_path(&file), valid_lock).unwrap();
+    fs::write(&file, "@article{two, title={Two}}\n").unwrap();
+    history::sync(&file, None, false, false, Some("agent")).unwrap();
+    assert!(history::status(&file, None).unwrap().valid);
+    assert!(!read_lock(&file)["deletedEntries"]["one"].is_null());
+    let revisions = history::log(&file, None, "one").unwrap();
+    assert_eq!(revisions.len(), 2);
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["history", "restore"])
+        .arg(&file)
+        .args(["--revision", &revisions[0].id, "--in-place"])
+        .assert()
+        .success();
+    assert!(read_lock(&file)["deletedEntries"]["one"].is_null());
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(&file)
+        .assert()
+        .success();
+}
+
+#[test]
+fn provider_apply_supersedes_human_approval_and_verify_keeps_current_approvals() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("refs.bib");
+    fs::write(&file, "@article{one, title={Old}, author={Doe, Jane}}").unwrap();
+    history::sync(&file, None, false, false, None).unwrap();
+    history::approve(&file, &BTreeSet::from(["one".to_owned()]), Some("Alice")).unwrap();
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["source", "verify"])
+        .arg(&file)
+        .args(["--all", "--in-place"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("already-verified"));
+    let base = mock_crossref_many(vec![
+        r#"{"message":{"DOI":"10.1234/test","type":"journal-article","title":["New"],"author":[{"family":"Doe","given":"Jane"}]}}"#,
+    ]);
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .env("BIBLOCK_CROSSREF_API_BASE", base)
+        .args(["source", "apply"])
+        .arg(&file)
+        .args([
+            "--key",
+            "one",
+            "--provider",
+            "crossref",
+            "--id",
+            "10.1234/test",
+            "--add-integrity",
+            "--in-place",
+        ])
+        .assert()
+        .success();
+    assert!(read_lock(&file)["entries"]["one"]["approval"].is_null());
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .args(["integrity", "status"])
+        .arg(&file)
+        .assert()
+        .success();
+}
+
+#[test]
+fn verification_previews_removals_and_rejects_changed_reviewed_metadata() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("refs.bib");
+    let original = "@article{one, title={Old}, doi={10.1234/test}, pages={1--2}}";
+    fs::write(&file, original).unwrap();
+    let base = mock_crossref_many(vec![
+        r#"{"message":{"DOI":"10.1234/test","type":"journal-article","title":["New"]}}"#,
+        r#"{"message":{"DOI":"10.1234/test","type":"journal-article","title":["Changed again"]}}"#,
+    ]);
+    let output = Command::cargo_bin("biblock")
+        .unwrap()
+        .env("BIBLOCK_CROSSREF_API_BASE", &base)
+        .args(["source", "verify"])
+        .arg(&file)
+        .args(["--all", "--providers", "crossref"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert!(
+        report[0]["candidates"][0]["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|change| change["field"] == "pages" && change["proposed"].is_null())
+    );
+    let preview = directory.path().join("preview.json");
+    fs::write(&preview, output).unwrap();
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .env("BIBLOCK_CROSSREF_API_BASE", &base)
+        .args(["source", "verify"])
+        .arg(&file)
+        .args([
+            "--all",
+            "--providers",
+            "crossref",
+            "--in-place",
+            "--reviewed",
+        ])
+        .arg(&preview)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("changed since dry run"));
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
+    assert!(!lock_path(&file).exists());
+}
+
+#[test]
+fn verify_resolves_eprint_and_openreview_can_search() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("refs.bib");
+    fs::write(
+        &file,
+        "@article{one, title={Paper}, author={Doe, Jane}, eprint={2301.12345}}",
+    )
+    .unwrap();
+    let base = mock_crossref_many(vec![
+        r#"{"message":{"DOI":"10.48550/arXiv.2301.12345","type":"journal-article","title":["Paper"],"author":[{"family":"Doe","given":"Jane"}]}}"#,
+    ]);
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .env("BIBLOCK_CROSSREF_API_BASE", base)
+        .args(["source", "verify"])
+        .arg(&file)
+        .args(["--all", "--providers", "crossref"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("10.48550/arXiv.2301.12345"));
+    fs::write(&file, "@article{one, title={Paper}, author={Doe, Jane}}").unwrap();
+    let base = mock_crossref_many(vec![
+        r#"{"notes":[{"id":"note1","content":{"title":{"value":"Paper"},"authors":{"value":["Jane Doe"]},"year":{"value":"2026"}}}]}"#,
+    ]);
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .env("BIBLOCK_OPENREVIEW_API_BASE", base)
+        .args(["source", "verify"])
+        .arg(&file)
+        .args(["--all", "--providers", "openreview"])
+        .assert()
+        .code(3)
+        .stdout(predicate::str::contains("needs-selection"));
+}
+
+#[test]
 fn browser_approval_is_content_bound_and_preserves_clean_bibtex() {
     let directory = tempfile::tempdir().unwrap();
     let file = directory.path().join("refs.bib");
@@ -94,6 +527,252 @@ fn read_lock(path: &Path) -> serde_json::Value {
 }
 
 #[test]
+fn diagnosis_reports_pending_entries_and_commands_without_writing() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("research notes.bib");
+    fs::write(&file, "@article{one, title={One}, author={An Author}}\n").unwrap();
+    let before = fs::read_to_string(&file).unwrap();
+    let output = Command::cargo_bin("biblock")
+        .unwrap()
+        .arg("diagnosis")
+        .arg(&file)
+        .assert()
+        .code(3)
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["ready"], false);
+    assert_eq!(report["network_checked"], false);
+    assert_eq!(report["lock"]["state"], "unlocked");
+    assert_eq!(report["summary"]["invalid"], 1);
+    assert_eq!(report["pending"][0]["key"], "one");
+    assert_eq!(
+        report["pending"][0]["commands"][0]["argv"][3],
+        file.to_str().unwrap()
+    );
+    assert!(
+        report["pending"][0]["commands"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("'")
+    );
+    assert_eq!(fs::read_to_string(&file).unwrap(), before);
+    assert!(!lock_path(&file).exists());
+}
+
+#[test]
+fn diagnosis_requires_current_approval_and_a_valid_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("refs.bib");
+    fs::write(&file, "@article{one, title={One}}\n").unwrap();
+    history::sync(&file, None, false, false, None).unwrap();
+    history::approve(&file, &BTreeSet::from(["one".to_owned()]), Some("reviewer")).unwrap();
+    let output = Command::cargo_bin("biblock")
+        .unwrap()
+        .arg("diagnosis")
+        .arg(&file)
+        .arg("--compact")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["ready"], true);
+    assert_eq!(report["summary"]["verified"], 1);
+    assert!(report["pending"].as_array().unwrap().is_empty());
+    fs::write(&file, "@article{one, title={Changed}}\n").unwrap();
+    let output = Command::cargo_bin("biblock")
+        .unwrap()
+        .arg("diagnosis")
+        .arg(&file)
+        .assert()
+        .code(3)
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["ready"], false);
+    assert_eq!(report["lock"]["state"], "stale");
+    assert_eq!(report["summary"]["stale"], 1);
+}
+
+#[test]
+fn diagnosis_reports_unreadable_evidence_and_rejects_duplicate_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("refs.bib");
+    fs::write(&file, "@article{one, title={One}}\n").unwrap();
+    fs::write(lock_path(&file), "not JSON").unwrap();
+    let output = Command::cargo_bin("biblock")
+        .unwrap()
+        .arg("diagnosis")
+        .arg(&file)
+        .assert()
+        .code(3)
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["lock"]["state"], "invalid");
+    assert_eq!(report["summary"]["invalid"], 1);
+    assert!(!report["lock"]["errors"].as_array().unwrap().is_empty());
+    assert!(!report["actions"].as_array().unwrap().iter().any(|action| {
+        action["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg == "--sync")
+    }));
+    assert_eq!(fs::read_to_string(lock_path(&file)).unwrap(), "not JSON");
+    fs::write(&file, "@article{one,title={A}} @article{one,title={B}}").unwrap();
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .arg("diagnosis")
+        .arg(&file)
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("duplicate citation key"));
+}
+
+#[test]
+fn diagnosis_batch_commands_select_only_unverified_keys() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("refs.bib");
+    fs::write(
+        &file,
+        "@article{approved,title={Approved}} @article{pending,title={Pending},author={An Author}}",
+    )
+    .unwrap();
+    history::sync(&file, None, false, false, None).unwrap();
+    history::approve(&file, &BTreeSet::from(["approved".to_owned()]), None).unwrap();
+    let output = Command::cargo_bin("biblock")
+        .unwrap()
+        .arg("diagnosis")
+        .arg(&file)
+        .assert()
+        .code(3)
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["summary"]["verified"], 1);
+    assert_eq!(report["summary"]["invalid"], 1);
+    let batch = report["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["argv"][2] == "verify")
+        .unwrap();
+    let argv = batch["argv"].as_array().unwrap();
+    assert!(argv.iter().any(|argument| argument == "pending"));
+    assert!(
+        !argv
+            .iter()
+            .any(|argument| argument == "approved" || argument == "--all")
+    );
+}
+
+#[test]
+fn diagnosis_without_a_file_discovers_bibliographies_and_keeps_per_file_errors() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(directory.path().join("a.bib"), "@article{one,title={One}}").unwrap();
+    fs::write(
+        directory.path().join("b.bib"),
+        "@article{one,title={Another}}",
+    )
+    .unwrap();
+    fs::write(
+        directory.path().join("ignored.bib.lock"),
+        "not a bibliography",
+    )
+    .unwrap();
+    let output = Command::cargo_bin("biblock")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("diagnosis")
+        .assert()
+        .code(3)
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["files"].as_array().unwrap().len(), 2);
+    assert_eq!(report["files"][0]["file"], "./a.bib");
+    assert_eq!(report["files"][1]["file"], "./b.bib");
+    assert_eq!(report["ready"], false);
+    fs::write(directory.path().join("broken.bib"), "@article{").unwrap();
+    let output = Command::cargo_bin("biblock")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("diagnosis")
+        .assert()
+        .code(2)
+        .get_output()
+        .stdout
+        .clone();
+    let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(report["files"].as_array().unwrap().len(), 2);
+    assert!(report["errors"]["./broken.bib"].is_string());
+}
+
+#[test]
+fn diagnosis_without_a_file_explains_an_empty_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    Command::cargo_bin("biblock")
+        .unwrap()
+        .current_dir(directory.path())
+        .arg("diagnosis")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("no .bib files found"));
+}
+
+#[test]
+fn diagnosis_routes_doi_candidates_and_web_references_to_specific_workflows() {
+    let directory = tempfile::tempdir().unwrap();
+    let file = directory.path().join("refs.bib");
+    fs::write(&file, r#"
+        @article{doi, title={Paper}, author={An Author}, doi={10.1/example}}
+        @article{candidate, title={Paper}, author={An Author}}
+        @misc{website, title={Product}, author={{Company}}, howpublished={\url{https://example.org}}}
+    "#).unwrap();
+    let report = biblock_cli::diagnosis::report(&file).unwrap();
+    let report = serde_json::to_value(report).unwrap();
+    let entries = report["pending"].as_array().unwrap();
+    assert_eq!(entries[0]["recommended_path"], "api_verify");
+    assert_eq!(entries[0]["commands"][0]["argv"][2], "verify");
+    assert_eq!(entries[1]["recommended_path"], "candidate_review");
+    let template = &entries[1]["templates"][0];
+    assert_eq!(template["writes"], true);
+    assert!(template["placeholders"]["PROVIDER_RECORD_ID"].is_string());
+    assert!(template["placeholders"]["AGENT_ID"].is_string());
+    assert!(
+        template["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg == "propose")
+    );
+    assert_eq!(entries[2]["recommended_path"], "human_review");
+    assert_eq!(entries[2]["commands"][0]["argv"][1], "review");
+    assert!(entries[2]["templates"].as_array().unwrap().is_empty());
+    let batch = report["actions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|action| action["argv"][2] == "verify")
+        .unwrap();
+    assert!(
+        !batch["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|arg| arg == "website")
+    );
+}
+
+#[test]
 fn top_level_help_documents_inspect_pipe_and_review_workflow() {
     Command::cargo_bin("biblock")
         .unwrap()
@@ -107,6 +786,8 @@ fn top_level_help_documents_inspect_pipe_and_review_workflow() {
                 .and(predicate::str::contains("SCOPE"))
                 .and(predicate::str::contains("INTEGRITY"))
                 .and(predicate::str::contains("EXIT STATUS"))
+                .and(predicate::str::contains("agentAdoptable"))
+                .and(predicate::str::contains("--reviewed"))
                 .and(predicate::str::contains(
                     "biblock integrity add refs.bib --keys-from - --source agent --agent MODEL --in-place",
                 ))
@@ -145,6 +826,31 @@ fn source_help_explains_provider_and_review_workflow() {
                 .and(predicate::str::contains("biblock source trace"))
                 .and(predicate::str::contains("biblock integrity add refs.bib")),
         );
+}
+
+#[test]
+fn proposal_help_embeds_the_complete_agent_contract() {
+    for args in [
+        vec!["proposal", "--help"],
+        vec!["source", "propose", "--help"],
+        vec!["proposal", "adopt", "--help"],
+    ] {
+        Command::cargo_bin("biblock")
+            .unwrap()
+            .args(args)
+            .assert()
+            .success()
+            .stdout(
+                predicate::str::contains("biblock diagnosis refs.bib")
+                    .and(predicate::str::contains("agentAdoptable"))
+                    .and(predicate::str::contains("agentAdoptionBlocker"))
+                    .and(predicate::str::contains("--reviewed"))
+                    .and(predicate::str::contains("never re-fetches"))
+                    .and(predicate::str::contains("does not grant API authority"))
+                    .and(predicate::str::contains("biblock review refs.bib"))
+                    .and(predicate::str::contains("lock --sync")),
+            );
+    }
 }
 
 #[test]
@@ -723,7 +1429,7 @@ fn json_lockfile_supports_sync_frozen_and_external_edits() {
         .stdout(predicate::str::contains("\"state\": \"locked\""));
 
     let lock = read_lock(&path);
-    assert_eq!(lock["lockfileVersion"], "1.0");
+    assert_eq!(lock["lockfileVersion"], "1.1");
     assert_eq!(lock["toolVersion"], env!("CARGO_PKG_VERSION"));
     assert!(lock["bibliography"]["contentHash"].is_string());
     assert!(lock["entries"]["alpha"]["contentHash"].is_string());
@@ -1306,6 +2012,15 @@ fn apply_records_search_selection_and_provider_chain() {
         r#"{"message":{"items":[{"score":123.0,"DOI":"10.1234/selected","type":"journal-article","title":["Selected title"],"author":[{"family":"Doe","given":"Jane"}],"issued":{"date-parts":[[2026]]}}]}}"#,
         r#"{"message":{"DOI":"10.1234/selected","type":"journal-article","title":["Selected title"],"author":[{"family":"Doe","given":"Jane"}],"issued":{"date-parts":[[2026]]}}}"#,
     ]);
+    let record = biblock_cli::bibtex::parse(&fs::read_to_string(&path).unwrap())
+        .unwrap()
+        .remove(0);
+    let reviewed_hash = biblock_cli::integrity::hash(&record).unwrap();
+    let fetched = biblock_cli::providers::record_from_evidence("crossref", "10.1234/selected",
+        br#"{"message":{"DOI":"10.1234/selected","type":"journal-article","title":["Selected title"],"author":[{"family":"Doe","given":"Jane"}],"issued":{"date-parts":[[2026]]}}}"#).unwrap();
+    let proposal_hash =
+        biblock_cli::integrity::hash(&biblock_cli::catalog::proposed_record(&record, &fetched))
+            .unwrap();
 
     Command::cargo_bin("biblock")
         .unwrap()
@@ -1319,6 +2034,10 @@ fn apply_records_search_selection_and_provider_chain() {
             "10.1234/selected",
             "--selected-by",
             "codex",
+            "--baseline-hash",
+            &reviewed_hash,
+            "--proposal-hash",
+            &proposal_hash,
             "--add-integrity",
             "--in-place",
         ])

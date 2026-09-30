@@ -468,23 +468,24 @@ fn update_entry_fields_impl(
         }
     }
 
-    if !missing.is_empty() {
-        let has_remaining_fields = entry.fields.iter().any(|field| {
-            !controlled_fields
-                .iter()
-                .any(|name| field.name.eq_ignore_ascii_case(name))
-                || fields.contains_key(&field.name)
-        });
-        edits.push(insertion_edit(
-            source,
-            entry,
-            missing.join(",\n"),
-            has_remaining_fields,
-        ));
-    }
     edits.sort_by_key(|edit| std::cmp::Reverse(edit.start));
     let mut output = source.to_owned();
     for edit in edits {
+        output.replace_range(edit.start..edit.end, &edit.replacement);
+    }
+    if !missing.is_empty() {
+        // Rescan after deletions so insertion uses the remaining comma and field layout.
+        let spans = scan_entries(&output)?;
+        let entry = spans
+            .iter()
+            .find(|entry| entry.key == key)
+            .context("updated entry missing")?;
+        let edit = insertion_edit(
+            &output,
+            entry,
+            missing.join(",\n"),
+            !entry.fields.is_empty(),
+        );
         output.replace_range(edit.start..edit.end, &edit.replacement);
     }
     Ok(output)

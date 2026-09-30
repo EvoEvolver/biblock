@@ -1,9 +1,11 @@
 pub mod bibtex;
 pub mod catalog;
 pub mod dedupe;
+pub mod diagnosis;
 pub mod history;
 pub mod inspect;
 pub mod integrity;
+pub mod proposal;
 pub mod provenance;
 pub mod providers;
 pub mod resolver;

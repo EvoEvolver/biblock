@@ -84,6 +84,14 @@ release. The default destination is `~/.local/bin`.
 
 ## Five-minute workflow
 
+Start with `biblock diagnosis` to check all `.bib` files in the current directory,
+or `biblock diagnosis references.bib` to check a specific file, for a local verification summary,
+pending citation keys, and commands tailored to the current lockfile and trust
+state. Its JSON includes executable argument arrays for agents. It makes no API
+requests and writes nothing. Exit `0` means the lockfile is consistent, every
+entry is verified, and no proposals are pending; `3` means work remains, and `2` means invalid input or an
+operational error.
+
 Start by inspecting the bibliography as JSON:
 
 ```sh
@@ -118,13 +126,14 @@ explicitly:
 ```sh
 biblock source match references.bib --key paper1 --min-score 0.9
 
-biblock source apply references.bib \
+biblock source propose references.bib \
   --key paper1 \
   --id 10.1234/chosen-record \
-  --selected-by codex \
-  --min-score 0.9 \
-  --add-integrity \
-  --in-place
+  --agent codex --min-score 0.9
+
+# Read the saved replacement, diff, scores and provider receipts.
+biblock proposal list references.bib
+biblock proposal adopt references.bib --id proposal:... --agent codex --reviewed
 ```
 
 `source match` searches a provider by title and reports separate title, author, and
@@ -137,8 +146,8 @@ Crossref is the default. OpenReview is also available for public notes:
 
 ```sh
 biblock source match references.bib --provider openreview --key paper1
-biblock source apply references.bib --provider openreview --key paper1 \
-  --id NOTE_ID --selected-by codex --min-score 0.9 --add-integrity --in-place
+biblock source propose references.bib --provider openreview --key paper1 \
+  --id NOTE_ID --agent codex --min-score 0.9
 ```
 
 Then inspect the evidence and validate the repository state:
@@ -166,6 +175,29 @@ still require human approval.
 
 ## Designed for agent review
 
+An agent can leave a complete replacement in the lockfile without changing the
+bibliography. A human then compares every field and adopts or rejects it:
+
+```sh
+biblock proposal create references.bib --key paper1 --bibtex replacement.bib \
+  --agent codex --reason 'Corrected metadata from the publisher'
+biblock review references.bib
+```
+
+Freeform proposals retain the old entry, replacement, rationale, optional evidence,
+and decision. Their adoption requires human approval and is reversible;
+changed baselines are rejected. Pending proposals keep `diagnosis` from reporting the project ready.
+See [workflows](docs/workflows.md) for hash-bound API previews and proposal details.
+
+Provider-backed proposals follow the same saved-diff workflow, but an agent can
+adopt a sufficiently matching, unambiguous candidate after reading it. Adoption
+uses the frozen API evidence without another lookup and grants provider-backed
+`verified` status, not a fabricated human approval.
+
+The CLI includes the agent workflow and review boundaries in `biblock --help`,
+`biblock source propose --help`, and `biblock proposal adopt --help`.
+No separate agent skill is required.
+
 `biblock` separates proposing a change from trusting it. An agent can inspect,
 search, score, and prepare a field-level diff without gaining permission to make
 an ambiguous choice. The final selection is explicit and remains visible in the
@@ -188,6 +220,10 @@ presented as provider verification or cryptographic identity.
 
 | Command | What it does |
 | --- | --- |
+| `biblock diagnosis [FILE]` | Summarize local verification state and suggest next commands |
+| `biblock source propose FILE --key KEY --id ID --agent AGENT` | Save a fixed provider replacement and evidence |
+| `biblock proposal list FILE` | Read saved replacements, comparisons, scores and decisions |
+| `biblock proposal adopt FILE --id ID --agent AGENT --reviewed` | Adopt an eligible provider proposal after agent review |
 | `biblock inspect [FILE ...]` | Emit entries and trust state as JSON |
 | `biblock dedupe [FILE ...]` | Generate title-and-author duplicate candidates |
 | `biblock source verify FILE --all` | Check exact identifiers across a bibliography |

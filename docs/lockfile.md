@@ -1,7 +1,7 @@
 # Lockfile, integrity, and trust model
 
 `biblock` keeps bibliography content and workflow state separate. This document
-describes the current `1.0` lockfile format and its guarantees. The project is
+describes the current `1.1` lockfile format and its guarantees. The project is
 still pre-1.0, so this is an implementation contract rather than a permanently
 frozen external specification.
 
@@ -22,11 +22,13 @@ Its top-level sections are:
 - `sources`, containing content-addressed provider, web, resolution, search,
   selection, human, and agent evidence;
 - `revisions`, containing content-addressed prior entry states.
+- `deletedEntries`, retaining deleted entry state and its history head;
+- `proposals`, retaining immutable agent replacements and human decisions.
 
 ```json
 {
-  "lockfileVersion": "1.0",
-  "toolVersion": "0.11.0",
+  "lockfileVersion": "1.1",
+  "toolVersion": "0.12.0",
   "bibliography": { "contentHash": "..." },
   "entries": {
     "turing1936": {
@@ -111,6 +113,39 @@ biblock history restore references.bib --revision 8f31c9d0 --in-place
 
 Restore is itself a recorded edit, so it can be reversed. Dry runs, stdout-only
 output, and no-op writes do not create revisions.
+
+Deleted entries keep their last snapshot and revision head in `deletedEntries`.
+Restoring a deleted snapshot reinserts the citation key and moves it back to
+`entries`. Validation checks history heads, target ownership and chain links.
+
+## Agent proposals
+
+The optional `proposals` map is keyed by a full content-addressed `proposal:...`
+ID. Each proposal stores `target`, `agent`, `reason`, `timestamp`, `baselineHash`,
+`proposalHash`, clean `before` and `after` records, and optional JSON `evidence`.
+The ID covers this immutable payload, not the eventual `decision`. Neither
+snapshot includes workflow fields. Citation keys must match the target.
+
+A decision contains `outcome` (`adopted` or `rejected`), `reviewer`, `timestamp`,
+and the adoption `revision` when an entry state changed. That link is validated
+against the proposal's original snapshot.
+No decision means pending; proposals and decisions are retained after review.
+Supporting evidence is not automatically treated as API authority. Adoption
+of a freeform proposal requires a matching current baseline and grants an explicit content-bound human
+approval while recording the previous entry in normal edit history. Pending
+proposals do not alter entry trust, but prevent the diagnosis readiness gate.
+
+Provider-backed proposals additionally store a typed `provider` object containing
+the exact projected record, title-search candidates, immutable receipts and the
+matching threshold. This object is covered by the proposal ID and validated
+against the replacement and receipt projection hashes. Existing freeform proposal
+IDs are unchanged. Eligible agent adoption writes `decision.agent`, provider
+integrity and history, without a human approval. Human review remains available
+for low-score or ambiguous provider proposals. No API lookup happens on adoption.
+
+Both new maps default to empty when reading existing `1.0` lockfiles. Writes use
+version `1.1` so older writers reject the file instead of silently discarding
+proposals or deleted-entry history. Existing `1.0` files require no manual conversion.
 
 ## Integrity calculation
 
